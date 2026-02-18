@@ -26,12 +26,19 @@ period = n_years * 365
 # -----------------------------------------------------------------------------
 # DATA LOADING
 # -----------------------------------------------------------------------------
+
 @st.cache_data
 def load_data(ticker):
     data = yf.download(ticker, START, TODAY)
+    
+    # --- FIX FOR YFINANCE MULTI-INDEX BUG ---
+    # If the columns are a MultiIndex (e.g., ('Close', 'AAPL')), flatten them.
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    # ----------------------------------------
+
     data.reset_index(inplace=True)
     return data
-
 data_load_state = st.text('Loading data...')
 data = load_data(selected_stock)
 data_load_state.text('Loading data... done!')
