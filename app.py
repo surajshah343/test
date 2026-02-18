@@ -14,7 +14,7 @@ START = "2015-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 
 st.set_page_config(page_title="Pro Stock Forecast App", layout="wide")
-st.title('📈Dashboard by S. Shah')
+st.title('📈 Institutional-Grade Stock Dashboard')
 
 # -----------------------------------------------------------------------------
 # SIDEBAR
@@ -56,19 +56,19 @@ def calculate_technicals(df):
     df['MACD'] = df['EMA_12'] - df['EMA_26']
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-    # 2. Bollinger Bands (Volatility Rubber Band)
+    # 2. Bollinger Bands (Volatility Rubber Band) & SMA
+    # The Middle Band (SMA 20) acts as the "Fair Value" baseline
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['Std_Dev'] = df['Close'].rolling(window=20).std()
     df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
     df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
-
-    # 3. VWAP (Institutional True Price)
-    # Note: True VWAP is intraday. We approximate "Rolling VWAP" for daily charts.
-    # We use (High + Low + Close) / 3 as the typical price
-    v = df['Volume'].values
-    tp = (df['High'] + df['Low'] + df['Close']) / 3
-    # We use a rolling window here to approximate the trend, or cumulative for the whole series
-    df['VWAP'] = (tp * v).cumsum() / v.cumsum()
+    
+    # 3. RSI (Relative Strength Index)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
     
     return df
 
@@ -83,7 +83,7 @@ tab1, tab2, tab3 = st.tabs(["📊 Prophet Forecast", "🧠 Pro Dashboard (Techni
 # TAB 1: ORIGINAL PROPHET FORECAST (LOGIC UNCHANGED)
 # =============================================================================
 with tab1:
-    st.subheader(f'Forecast for {selected_stock}')
+    st.subheader(f'AI Forecast for {selected_stock}')
     
     # Prophet Logic
     df_train = data[['Date','Close']]
@@ -109,14 +109,14 @@ with tab1:
         st.pyplot(fig2)
 
 # =============================================================================
-# TAB 2: PRO DASHBOARD (NEW COMPLEX INDICATORS)
+# TAB 2: PRO DASHBOARD (UPDATED)
 # =============================================================================
 with tab2:
     st.subheader("Institutional Technical Analysis")
     st.write("These indicators help answer: *Is the price fair? Is it overextended? Is momentum shifting?*")
 
-    # --- CHART 1: Price vs VWAP & Bollinger Bands ---
-    st.write("#### 1. Volatility & Fair Value (Bollinger Bands + VWAP)")
+    # --- CHART 1: Price vs Bollinger Bands ---
+    st.write("#### 1. Volatility & Trend (Bollinger Bands)")
     
     fig_bol = go.Figure()
     
@@ -128,11 +128,11 @@ with tab2:
         name='Price'
     ))
     
-    # VWAP Line
+    # Middle Band (SMA 20) - The "Fair Value" Baseline
     fig_bol.add_trace(go.Scatter(
-        x=data['Date'], y=data['VWAP'],
-        line=dict(color='orange', width=2),
-        name='VWAP (Fair Value)'
+        x=data['Date'], y=data['SMA_20'],
+        line=dict(color='orange', width=1),
+        name='20-Day SMA (Trend)'
     ))
     
     # Bollinger Bands
@@ -144,7 +144,7 @@ with tab2:
     fig_bol.add_trace(go.Scatter(
         x=data['Date'], y=data['Lower_Band'],
         line=dict(color='rgba(0,0,255,0.3)', width=1),
-        fill='tonexty', # Fills area between Upper and Lower
+        fill='tonexty', 
         fillcolor='rgba(0,0,255,0.05)',
         name='Lower Band'
     ))
@@ -154,12 +154,36 @@ with tab2:
     
     st.info("""
     **How to Read:**
-    * **The Orange Line (VWAP):** If Price is ABOVE this, bulls are in control (but it might be expensive). If BELOW, bears are in control (or it's "cheap").
-    * **The Blue Cloud (Bollinger Bands):** If the cloud is wide, the market is volatile. If the price touches the top edge, it's statistically "overextended" and might pull back.
+    * **The Orange Line (20-Day SMA):** This is the short-term baseline. If price is above it, the trend is UP.
+    * **The Blue Bands:** These measure volatility. If the price touches the **Top Band**, the stock is expensive (overbought). If it touches the **Bottom Band**, it is cheap (oversold).
     """)
 
-    # --- CHART 2: MACD MOMENTUM ---
-    st.write("#### 2. Momentum Speedometer (MACD)")
+    # --- CHART 2: RSI (Relative Strength Index) ---
+    st.write("#### 2. Relative Strength Index (RSI)")
+    
+    fig_rsi = go.Figure()
+    
+    fig_rsi.add_trace(go.Scatter(
+        x=data['Date'], y=data['RSI'],
+        line=dict(color='purple', width=2),
+        name='RSI'
+    ))
+    
+    # Overbought/Oversold Lines
+    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (Sell Risk)")
+    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (Buy Opp)")
+    
+    fig_rsi.update_layout(height=300, yaxis_range=[0, 100], xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig_rsi, use_container_width=True)
+
+    st.info("""
+    **How to Read:**
+    * **Above 70:** The stock has gone up too fast and might crash/pull back.
+    * **Below 30:** The stock has been sold off too hard and might bounce back.
+    """)
+
+    # --- CHART 3: MACD MOMENTUM ---
+    st.write("#### 3. Momentum Speedometer (MACD)")
     
     fig_macd = go.Figure()
     
@@ -197,7 +221,8 @@ with tab2:
 # =============================================================================
 # TAB 3: RAW DATA
 # =============================================================================
-with tab3:
-    st.dataframe(data.tail(50))
-    csv = data.to_csv(index=False).encode('utf-8')
-    st.download_button("Download CSV", data=csv, file_name=f"{selected_stock}_pro_data.csv", mime="text/csv")
+#with tab3:
+
+#st.dataframe(data.tail(50))
+#    csv = data.to_csv(index=False).encode('utf-8')
+#    st.download_button("Download CSV", data=csv, file_name=f"{selected_stock}_pro_data.csv", mime="text/csv")
