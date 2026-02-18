@@ -64,8 +64,10 @@ def calculate_technicals(df):
 
     # 3. VWAP (Institutional True Price)
     # Note: True VWAP is intraday. We approximate "Rolling VWAP" for daily charts.
+    # We use (High + Low + Close) / 3 as the typical price
     v = df['Volume'].values
     tp = (df['High'] + df['Low'] + df['Close']) / 3
+    # We use a rolling window here to approximate the trend, or cumulative for the whole series
     df['VWAP'] = (tp * v).cumsum() / v.cumsum()
     
     return df
@@ -83,10 +85,6 @@ tab1, tab2, tab3 = st.tabs(["📊 Prophet Forecast", "🧠 Pro Dashboard (Techni
 with tab1:
     st.subheader(f'AI Forecast for {selected_stock}')
     
-    # 
-
-[Image of Time Series Projection]
- - Conceptualizing the forecast line
     # Prophet Logic
     df_train = data[['Date','Close']]
     df_train = df_train.rename(columns={"Date": "ds", "Close": "y"})
@@ -97,6 +95,7 @@ with tab1:
     forecast = m.predict(future)
 
     # Plot
+    st.write(f'Forecast plot for {n_years} years')
     fig1 = plot_plotly(m, forecast)
     fig1.update_layout(
         title=f"Prophet Forecast: {n_years} Year Horizon",
@@ -118,11 +117,6 @@ with tab2:
 
     # --- CHART 1: Price vs VWAP & Bollinger Bands ---
     st.write("#### 1. Volatility & Fair Value (Bollinger Bands + VWAP)")
-    
-    # 
-
-[Image of Bollinger Band Squeeze]
- - Visualizing volatility compression
     
     fig_bol = go.Figure()
     
@@ -166,8 +160,6 @@ with tab2:
 
     # --- CHART 2: MACD MOMENTUM ---
     st.write("#### 2. Momentum Speedometer (MACD)")
-    
-    #  - Visualizing momentum shifts
     
     fig_macd = go.Figure()
     
