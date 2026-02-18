@@ -14,7 +14,7 @@ START = "2015-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 
 st.set_page_config(page_title="Pro Stock Forecast App", layout="wide")
-st.title('📈 Suraj's Stock Dashboard')
+st.title('📈Stock Dashboard by S. Shah')
 
 # -----------------------------------------------------------------------------
 # SIDEBAR
