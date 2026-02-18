@@ -14,7 +14,7 @@ START = "2015-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 
 st.set_page_config(page_title="Pro Stock Forecast App", layout="wide")
-st.title('📈 Institutional-Grade Stock Dashboard')
+st.title('📈 Stock Dashboard by S. Shah')
 
 # -----------------------------------------------------------------------------
 # SIDEBAR
@@ -83,7 +83,7 @@ tab1, tab2, tab3 = st.tabs(["📊 Prophet Forecast", "🧠 Pro Dashboard (Techni
 # TAB 1: ORIGINAL PROPHET FORECAST (LOGIC UNCHANGED)
 # =============================================================================
 with tab1:
-    st.subheader(f'AI Forecast for {selected_stock}')
+    st.subheader(f'Forecast for {selected_stock}')
     
     # Prophet Logic
     df_train = data[['Date','Close']]
@@ -112,7 +112,7 @@ with tab1:
 # TAB 2: PRO DASHBOARD (UPDATED)
 # =============================================================================
 with tab2:
-    st.subheader("Institutional Technical Analysis")
+    st.subheader("Technical Analysis")
     st.write("These indicators help answer: *Is the price fair? Is it overextended? Is momentum shifting?*")
 
     # --- CHART 1: Price vs Bollinger Bands ---
