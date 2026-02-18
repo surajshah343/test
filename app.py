@@ -2,10 +2,12 @@ import streamlit as st
 from datetime import date
 import yfinance as yf
 from prophet import Prophet
-from plotly.subplots import make_subplots # Import Subplots
+from prophet.plot import plot_plotly
 from plotly import graph_objs as go
+from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
@@ -47,7 +49,7 @@ if data is None or data.empty:
     st.stop()
 
 # -----------------------------------------------------------------------------
-# CALCULATE PROFESSIONAL INDICATORS (Technical Analysis)
+# TECHNICAL INDICATORS
 # -----------------------------------------------------------------------------
 def calculate_technicals(df):
     # 1. MACD
@@ -85,74 +87,55 @@ future = m.make_future_dataframe(periods=period)
 forecast = m.predict(future)
 
 # -----------------------------------------------------------------------------
-# MASTER DASHBOARD (ALL IN ONE)
+# DASHBOARD LAYOUT
 # -----------------------------------------------------------------------------
-# We create one figure with 4 stacked rows that share the X-axis (Time)
+st.subheader(f"Unified Dashboard: {selected_stock}")
+
+# --- 1. THE BIG INTERACTIVE CHART (Forecast + Technicals) ---
+# Create 4 stacked subplots with shared X-axis
 fig = make_subplots(
     rows=4, cols=1, 
-    shared_xaxes=True, # THIS IS THE KEY: SYNCHRONIZES ZOOM
-    vertical_spacing=0.05, 
-    subplot_titles=(f'{selected_stock} Forecast & Price', 'Bollinger Bands', 'RSI', 'MACD'),
-    row_heights=[0.4, 0.2, 0.2, 0.2] # Give more space to the main forecast chart
+    shared_xaxes=True, 
+    vertical_spacing=0.03, 
+    subplot_titles=('Price Forecast', 'Bollinger Bands', 'RSI', 'MACD'),
+    row_heights=[0.5, 0.2, 0.15, 0.15]
 )
 
-# --- ROW 1: PROPHET FORECAST ---
-# 1. Actual Data (Black Dots)
-fig.add_trace(go.Scatter(x=df_train['ds'], y=df_train['y'], name='Actual', mode='markers', marker=dict(color='black', size=4)), row=1, col=1)
-
-# 2. Predicted Trend (Blue Line)
+# ROW 1: Forecast
+fig.add_trace(go.Scatter(x=df_train['ds'], y=df_train['y'], name='Actual', mode='markers', marker=dict(color='black', size=2)), row=1, col=1)
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Prediction', mode='lines', line=dict(color='blue')), row=1, col=1)
+fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(width=0), showlegend=False), row=1, col=1)
+fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'), row=1, col=1)
 
-# 3. Confidence Interval (Upper & Lower)
-fig.add_trace(go.Scatter(
-    x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(width=0), showlegend=False
-), row=1, col=1)
-fig.add_trace(go.Scatter(
-    x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'
-), row=1, col=1)
-
-
-# --- ROW 2: BOLLINGER BANDS ---
-# 1. Price Candle/Line
-fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name='Price', line=dict(color='black', width=1)), row=2, col=1)
-# 2. Upper Band
+# ROW 2: Bollinger Bands
+fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name='Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
 fig.add_trace(go.Scatter(x=data['Date'], y=data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
-# 3. Lower Band
 fig.add_trace(go.Scatter(x=data['Date'], y=data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
 
-
-# --- ROW 3: RSI ---
+# ROW 3: RSI
 fig.add_trace(go.Scatter(x=data['Date'], y=data['RSI'], name='RSI', line=dict(color='purple')), row=3, col=1)
-# Add static lines for Overbought (70) and Oversold (30)
 fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
 fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
 
-
-# --- ROW 4: MACD ---
+# ROW 4: MACD
 fig.add_trace(go.Scatter(x=data['Date'], y=data['MACD'], name='MACD', line=dict(color='blue')), row=4, col=1)
 fig.add_trace(go.Scatter(x=data['Date'], y=data['Signal_Line'], name='Signal', line=dict(color='red')), row=4, col=1)
-# Histogram
 colors = ['green' if val >= 0 else 'red' for val in (data['MACD'] - data['Signal_Line'])]
 fig.add_trace(go.Bar(x=data['Date'], y=(data['MACD'] - data['Signal_Line']), name='Hist', marker_color=colors), row=4, col=1)
 
-
-# --- LAYOUT UPDATE ---
-fig.update_layout(
-    height=1200, # Make it tall enough
-    showlegend=True,
-    title_text="Unified Technical & Forecast Dashboard"
-)
-
-# Remove Range Slider from subplots to avoid clutter (since we have shared zoom)
+fig.update_layout(height=1000, title_text=f"Technical & Forecast Analysis for {selected_stock}")
 fig.update_xaxes(rangeslider_visible=False)
-
-# Display the Master Chart
 st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# RAW DATA TAB
-# -----------------------------------------------------------------------------
-with st.expander("📝 View Raw Data"):
-    st.dataframe(data.tail(50))
-    csv = data.to_csv(index=False).encode('utf-8')
-    st.download_button("Download CSV", data=csv, file_name=f"{selected_stock}_data.csv", mime="text/csv")
+# --- 2. FORECAST COMPONENTS (The "Tables" you missed) ---
+st.write("---")
+st.header("Forecast Components (Trends & Seasonality)")
+st.write("Below are the specific trends extracted by the model (Weekly, Yearly, and Overall Trend).")
+
+# We render the matplotlib figure here
+fig2 = m.plot_components(forecast)
+st.pyplot(fig2)
+
+# --- 3. RAW DATA ---
+with st.expander("View Raw Data"):
+    st.dataframe(data.tail())
