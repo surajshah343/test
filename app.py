@@ -2,7 +2,7 @@ import streamlit as st
 from datetime import date
 import yfinance as yf
 from prophet import Prophet
-from prophet.plot import plot_plotly
+from plotly.subplots import make_subplots # Import Subplots
 from plotly import graph_objs as go
 import pandas as pd
 import numpy as np
@@ -50,20 +50,19 @@ if data is None or data.empty:
 # CALCULATE PROFESSIONAL INDICATORS (Technical Analysis)
 # -----------------------------------------------------------------------------
 def calculate_technicals(df):
-    # 1. MACD (Trend Speedometer)
+    # 1. MACD
     df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = df['EMA_12'] - df['EMA_26']
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-    # 2. Bollinger Bands (Volatility Rubber Band) & SMA
-    # The Middle Band (SMA 20) acts as the "Fair Value" baseline
+    # 2. Bollinger Bands
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['Std_Dev'] = df['Close'].rolling(window=20).std()
     df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
     df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
     
-    # 3. RSI (Relative Strength Index)
+    # 3. RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -75,154 +74,85 @@ def calculate_technicals(df):
 data = calculate_technicals(data)
 
 # -----------------------------------------------------------------------------
-# TABS
+# FORECASTING LOGIC
 # -----------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["📊 Prophet Forecast", "🧠 Pro Dashboard (Technical Analysis)", "📝 Raw Data"])
+df_train = data[['Date','Close']]
+df_train = df_train.rename(columns={"Date": "ds", "Close": "y"})
 
-# =============================================================================
-# TAB 1: ORIGINAL PROPHET FORECAST (LOGIC UNCHANGED)
-# =============================================================================
-with tab1:
-    st.subheader(f'Forecast for {selected_stock}')
-    
-    # Prophet Logic
-    df_train = data[['Date','Close']]
-    df_train = df_train.rename(columns={"Date": "ds", "Close": "y"})
+m = Prophet()
+m.fit(df_train)
+future = m.make_future_dataframe(periods=period)
+forecast = m.predict(future)
 
-    m = Prophet()
-    m.fit(df_train)
-    future = m.make_future_dataframe(periods=period)
-    forecast = m.predict(future)
+# -----------------------------------------------------------------------------
+# MASTER DASHBOARD (ALL IN ONE)
+# -----------------------------------------------------------------------------
+# We create one figure with 4 stacked rows that share the X-axis (Time)
+fig = make_subplots(
+    rows=4, cols=1, 
+    shared_xaxes=True, # THIS IS THE KEY: SYNCHRONIZES ZOOM
+    vertical_spacing=0.05, 
+    subplot_titles=(f'{selected_stock} Forecast & Price', 'Bollinger Bands', 'RSI', 'MACD'),
+    row_heights=[0.4, 0.2, 0.2, 0.2] # Give more space to the main forecast chart
+)
 
-    # Plot
-    st.write(f'Forecast plot for {n_years} years')
-    fig1 = plot_plotly(m, forecast)
-    fig1.update_layout(
-        title=f"Prophet Forecast: {n_years} Year Horizon",
-        yaxis_title="Stock Price (USD)",
-        xaxis_title="Date"
-    )
-    st.plotly_chart(fig1, use_container_width=True)
+# --- ROW 1: PROPHET FORECAST ---
+# 1. Actual Data (Black Dots)
+fig.add_trace(go.Scatter(x=df_train['ds'], y=df_train['y'], name='Actual', mode='markers', marker=dict(color='black', size=4)), row=1, col=1)
 
-    with st.expander("See Forecast Components"):
-        fig2 = m.plot_components(forecast)
-        st.pyplot(fig2)
+# 2. Predicted Trend (Blue Line)
+fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Prediction', mode='lines', line=dict(color='blue')), row=1, col=1)
 
-# =============================================================================
-# TAB 2: PRO DASHBOARD (UPDATED)
-# =============================================================================
-with tab2:
-    st.subheader("Technical Analysis")
-    st.write("These indicators help answer: *Is the price fair? Is it overextended? Is momentum shifting?*")
+# 3. Confidence Interval (Upper & Lower)
+fig.add_trace(go.Scatter(
+    x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(width=0), showlegend=False
+), row=1, col=1)
+fig.add_trace(go.Scatter(
+    x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'
+), row=1, col=1)
 
-    # --- CHART 1: Price vs Bollinger Bands ---
-    st.write("#### 1. Volatility & Trend (Bollinger Bands)")
-    
-    fig_bol = go.Figure()
-    
-    # Candlestick for Price
-    fig_bol.add_trace(go.Candlestick(
-        x=data['Date'],
-        open=data['Open'], high=data['High'],
-        low=data['Low'], close=data['Close'],
-        name='Price'
-    ))
-    
-    # Middle Band (SMA 20) - The "Fair Value" Baseline
-    fig_bol.add_trace(go.Scatter(
-        x=data['Date'], y=data['SMA_20'],
-        line=dict(color='orange', width=1),
-        name='20-Day SMA (Trend)'
-    ))
-    
-    # Bollinger Bands
-    fig_bol.add_trace(go.Scatter(
-        x=data['Date'], y=data['Upper_Band'],
-        line=dict(color='rgba(0,0,255,0.3)', width=1),
-        name='Upper Band'
-    ))
-    fig_bol.add_trace(go.Scatter(
-        x=data['Date'], y=data['Lower_Band'],
-        line=dict(color='rgba(0,0,255,0.3)', width=1),
-        fill='tonexty', 
-        fillcolor='rgba(0,0,255,0.05)',
-        name='Lower Band'
-    ))
 
-    fig_bol.update_layout(height=600, xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig_bol, use_container_width=True)
-    
-    st.info("""
-    **How to Read:**
-    * **The Orange Line (20-Day SMA):** This is the short-term baseline. If price is above it, the trend is UP.
-    * **The Blue Bands:** These measure volatility. If the price touches the **Top Band**, the stock is expensive (overbought). If it touches the **Bottom Band**, it is cheap (oversold).
-    """)
+# --- ROW 2: BOLLINGER BANDS ---
+# 1. Price Candle/Line
+fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name='Price', line=dict(color='black', width=1)), row=2, col=1)
+# 2. Upper Band
+fig.add_trace(go.Scatter(x=data['Date'], y=data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
+# 3. Lower Band
+fig.add_trace(go.Scatter(x=data['Date'], y=data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
 
-    # --- CHART 2: RSI (Relative Strength Index) ---
-    st.write("#### 2. Relative Strength Index (RSI)")
-    
-    fig_rsi = go.Figure()
-    
-    fig_rsi.add_trace(go.Scatter(
-        x=data['Date'], y=data['RSI'],
-        line=dict(color='purple', width=2),
-        name='RSI'
-    ))
-    
-    # Overbought/Oversold Lines
-    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (Sell Risk)")
-    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (Buy Opp)")
-    
-    fig_rsi.update_layout(height=300, yaxis_range=[0, 100], xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig_rsi, use_container_width=True)
 
-    st.info("""
-    **How to Read:**
-    * **Above 70:** The stock has gone up too fast and might crash/pull back.
-    * **Below 30:** The stock has been sold off too hard and might bounce back.
-    """)
+# --- ROW 3: RSI ---
+fig.add_trace(go.Scatter(x=data['Date'], y=data['RSI'], name='RSI', line=dict(color='purple')), row=3, col=1)
+# Add static lines for Overbought (70) and Oversold (30)
+fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
 
-    # --- CHART 3: MACD MOMENTUM ---
-    st.write("#### 3. Momentum Speedometer (MACD)")
-    
-    fig_macd = go.Figure()
-    
-    # MACD Line
-    fig_macd.add_trace(go.Scatter(
-        x=data['Date'], y=data['MACD'],
-        line=dict(color='blue', width=2),
-        name='MACD (Fast)'
-    ))
-    
-    # Signal Line
-    fig_macd.add_trace(go.Scatter(
-        x=data['Date'], y=data['Signal_Line'],
-        line=dict(color='red', width=2),
-        name='Signal (Slow)'
-    ))
-    
-    # Histogram (Difference)
-    colors = ['green' if val >= 0 else 'red' for val in (data['MACD'] - data['Signal_Line'])]
-    fig_macd.add_trace(go.Bar(
-        x=data['Date'], y=(data['MACD'] - data['Signal_Line']),
-        marker_color=colors,
-        name='Momentum Histogram'
-    ))
 
-    fig_macd.update_layout(height=400, xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig_macd, use_container_width=True)
+# --- ROW 4: MACD ---
+fig.add_trace(go.Scatter(x=data['Date'], y=data['MACD'], name='MACD', line=dict(color='blue')), row=4, col=1)
+fig.add_trace(go.Scatter(x=data['Date'], y=data['Signal_Line'], name='Signal', line=dict(color='red')), row=4, col=1)
+# Histogram
+colors = ['green' if val >= 0 else 'red' for val in (data['MACD'] - data['Signal_Line'])]
+fig.add_trace(go.Bar(x=data['Date'], y=(data['MACD'] - data['Signal_Line']), name='Hist', marker_color=colors), row=4, col=1)
 
-    st.info("""
-    **How to Read:**
-    * **Crossover:** When the Blue Line crosses ABOVE the Red Line, it's a **"BUY"** signal (momentum is shifting up).
-    * **Histogram:** Green bars mean the uptrend is accelerating. Red bars mean the downtrend is accelerating.
-    """)
 
-# =============================================================================
-# TAB 3: RAW DATA
-# =============================================================================
-#with tab3:
+# --- LAYOUT UPDATE ---
+fig.update_layout(
+    height=1200, # Make it tall enough
+    showlegend=True,
+    title_text="Unified Technical & Forecast Dashboard"
+)
 
-#st.dataframe(data.tail(50))
-#    csv = data.to_csv(index=False).encode('utf-8')
-#    st.download_button("Download CSV", data=csv, file_name=f"{selected_stock}_pro_data.csv", mime="text/csv")
+# Remove Range Slider from subplots to avoid clutter (since we have shared zoom)
+fig.update_xaxes(rangeslider_visible=False)
+
+# Display the Master Chart
+st.plotly_chart(fig, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# RAW DATA TAB
+# -----------------------------------------------------------------------------
+with st.expander("📝 View Raw Data"):
+    st.dataframe(data.tail(50))
+    csv = data.to_csv(index=False).encode('utf-8')
+    st.download_button("Download CSV", data=csv, file_name=f"{selected_stock}_data.csv", mime="text/csv")
