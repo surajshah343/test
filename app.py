@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import json
 from datetime import date
 import yfinance as yf
 from plotly.subplots import make_subplots
@@ -7,7 +8,6 @@ from plotly import graph_objs as go
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-import calendar 
 
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
@@ -15,7 +15,7 @@ import calendar
 START = "1995-01-01" 
 TODAY = date.today().strftime("%Y-%m-%d")
 
-# Create a directory to store the "brain" of our models
+# Create a directory to store the "brain" and metadata
 os.makedirs("saved_models", exist_ok=True)
 
 st.set_page_config(page_title="Pro Dashboard", layout="wide")
@@ -32,6 +32,7 @@ n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 forecast_days = n_years * 252 
 
 MODEL_FILE = f"saved_models/{selected_stock}_continuous_model.json"
+META_FILE = f"saved_models/{selected_stock}_meta.json"
 
 # -----------------------------------------------------------------------------
 # DATA LOADING
@@ -97,7 +98,6 @@ def engineer_features(df):
     df['SMA_20_Pct'] = df['SMA_20'] / df['Close'] - 1
     df['MACD_Pct'] = df['MACD'] / df['Close']
     
-    # Rolling Volatility (Helps AI understand market chaos)
     df['Vol_20'] = df['Lag_1_Ret'].rolling(window=20).std()
     
     df['Daily_Return'] = df['Close'].pct_change()
@@ -112,85 +112,133 @@ target = 'Target_Return'
 full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 
 # -----------------------------------------------------------------------------
-# CONTINUOUS LEARNING ENGINE (Self-Correction Logic)
+# CONTINUOUS LEARNING ENGINE (Corrected Logic)
 # -----------------------------------------------------------------------------
 final_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
 is_new_model = not os.path.exists(MODEL_FILE)
 
+# Exclude the last row where Target_Return is NaN
+trainable_data = full_ml_data.copy() 
+latest_available_date = trainable_data['Date'].max().strftime("%Y-%m-%d")
+
 if is_new_model:
-    st.sidebar.warning("⚠️ No saved brain found. Training baseline model from scratch...")
+    st.sidebar.warning("⚠️ No saved brain found. Training baseline model...")
     with st.spinner("Compiling initial AI brain..."):
-        # Train on everything we have
-        final_model.fit(full_ml_data[features], full_ml_data[target])
+        final_model.fit(trainable_data[features], trainable_data[target])
         final_model.save_model(MODEL_FILE)
+        
+        with open(META_FILE, 'w') as f:
+            json.dump({"last_trained_date": latest_available_date}, f)
+            
         st.sidebar.success("✅ Baseline Brain Saved!")
 else:
-    # Load the existing model
     final_model.load_model(MODEL_FILE)
-    st.sidebar.success("✅ Existing AI Brain Loaded!")
     
-    # --- The Self-Correction Mechanism ---
-    # In a production environment, you would log the exact date the model was last updated.
-    # For this dashboard, we will simulate the daily update by grabbing the most recent 5 days
-    # of data and using XGBoost's incremental update feature to correct its recent mistakes.
+    last_trained_date = "1990-01-01"
+    if os.path.exists(META_FILE):
+        with open(META_FILE, 'r') as f:
+            meta = json.load(f)
+            last_trained_date = meta.get("last_trained_date", "1990-01-01")
     
-    recent_unseen_data = full_ml_data.tail(5) 
-    
-    with st.spinner("Reviewing recent mistakes and updating neural pathways..."):
-        # The 'xgb_model' parameter tells XGBoost to add new trees to correct the residuals 
-        # of the loaded model, rather than starting from scratch.
-        final_model.fit(
-            recent_unseen_data[features], 
-            recent_unseen_data[target], 
-            xgb_model=MODEL_FILE # This is the crucial incremental learning step
-        )
-        final_model.save_model(MODEL_FILE)
-        st.sidebar.info("🧠 Brain updated with recent market behavior.")
+    # Only train if there is new data we haven't trained on yet
+    if latest_available_date > last_trained_date:
+        st.sidebar.info("🧠 New market data detected. Updating pathways...")
+        new_data = trainable_data[trainable_data['Date'] > last_trained_date]
+        
+        if not new_data.empty:
+            with st.spinner("Learning from recent mistakes..."):
+                final_model.fit(
+                    new_data[features], 
+                    new_data[target], 
+                    xgb_model=MODEL_FILE 
+                )
+                final_model.save_model(MODEL_FILE)
+                
+                with open(META_FILE, 'w') as f:
+                    json.dump({"last_trained_date": latest_available_date}, f)
+                st.sidebar.success("✅ Brain updated with recent behavior.")
+    else:
+        st.sidebar.success("✅ AI Brain up to date!")
 
 # -----------------------------------------------------------------------------
-# AUTOREGRESSIVE FORECAST FUNCTION
+# OPTIMIZED AUTOREGRESSIVE FORECAST WITH CONFIDENCE INTERVALS
 # -----------------------------------------------------------------------------
 def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predict):
-    buffer = start_buffer.copy()
+    records = start_buffer.to_dict('records')
     predictions = []
     
-    for date_val in dates_to_predict:
-        current_features_df = engineer_features(buffer) 
-        last_row = current_features_df.iloc[-1]
+    # Calculate baseline volatility for the confidence cone
+    recent_volatility = np.std([r['Close'] for r in records[-20:]])
+    base_price = records[-1]['Close']
+    
+    for i, date_val in enumerate(dates_to_predict):
+        last_rec = records[-1]
+        prev_rec = records[-2]
+        
+        closes = [r['Close'] for r in records[-26:]] 
+        
+        current_close = last_rec['Close']
+        lag_1_ret = current_close / prev_rec['Close'] - 1
+        lag_2_ret = current_close / records[-3]['Close'] - 1
+        
+        sma_10 = np.mean(closes[-10:])
+        sma_20 = np.mean(closes[-20:])
+        
+        macd = (np.mean(closes[-12:]) - np.mean(closes[-26:]))
+        vol_20 = np.std([r['Close']/records[idx-1]['Close']-1 for idx, r in enumerate(records[-20:]) if idx > 0])
         
         X_pred = pd.DataFrame({
-            'Lag_1_Ret': [last_row['Lag_1_Ret']],
-            'Lag_2_Ret': [last_row['Lag_2_Ret']],
-            'SMA_10_Pct': [last_row['SMA_10_Pct']],
-            'SMA_20_Pct': [last_row['SMA_20_Pct']],
-            'MACD_Pct': [last_row['MACD_Pct']],
-            'RSI': [last_row['RSI']],
-            'Vol_20': [last_row['Vol_20']],
+            'Lag_1_Ret': [lag_1_ret],
+            'Lag_2_Ret': [lag_2_ret],
+            'SMA_10_Pct': [(sma_10 / current_close) - 1],
+            'SMA_20_Pct': [(sma_20 / current_close) - 1],
+            'MACD_Pct': [macd / current_close if current_close != 0 else 0],
+            'RSI': [last_rec.get('RSI', 50)],
+            'Vol_20': [vol_20],
             'DayOfYear': [date_val.dayofyear],
             'Month': [date_val.month]
         })
         
         predicted_return = trained_model.predict(X_pred)[0]
-        new_close = last_row['Close'] * (1 + predicted_return)
         
-        predictions.append({'Date': date_val, 'Close': new_close})
+        # Decay factor prevents exponential error explosion
+        decay_factor = max(0, 1 - (i / len(dates_to_predict)))
+        adjusted_return = predicted_return * decay_factor
         
-        new_row = pd.DataFrame({'Date': [date_val], 'Close': [new_close]})
-        buffer = pd.concat([buffer, new_row], ignore_index=True).tail(300) 
+        new_close = current_close * (1 + adjusted_return)
         
-    return pd.DataFrame(predictions)
+        # Calculate Confidence Interval (expanding cone based on square root of time)
+        # 1.96 standard deviations roughly equals a 95% confidence interval
+        step_uncertainty = (recent_volatility * 1.96 * np.sqrt(i + 1)) * (new_close / base_price)
+        upper_bound = new_close + step_uncertainty
+        lower_bound = new_close - step_uncertainty
+        
+        new_record = {
+            'Date': date_val, 
+            'Close': new_close, 
+            'RSI': last_rec.get('RSI', 50),
+            'Upper_Bound': upper_bound,
+            'Lower_Bound': lower_bound
+        }
+        
+        records.append(new_record)
+        predictions.append(new_record)
+        
+        if len(records) > 50:
+            records.pop(0)
+            
+    return pd.DataFrame(predictions)[['Date', 'Close', 'Upper_Bound', 'Lower_Bound']]
 
 # -----------------------------------------------------------------------------
 # FUTURE FORECAST GENERATION
 # -----------------------------------------------------------------------------
 with st.spinner("Generating Future Forecast..."):
-    future_start_buffer = data[['Date', 'Close']].tail(300).copy()
+    future_start_buffer = data[['Date', 'Close']].tail(30).copy()
     last_actual_date = future_start_buffer['Date'].iloc[-1]
     
     future_dates = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=forecast_days, freq='B')
     future_forecast = generate_autoregressive_forecast(final_model, future_start_buffer, future_dates)
 
-# Generate smooth plotting data
 plot_buffer = pd.concat([data[['Date', 'Close']], future_forecast[['Date', 'Close']]], ignore_index=True)
 plot_data = engineer_features(plot_buffer)
 
@@ -241,17 +289,40 @@ with st.container():
         row_heights=[0.5, 0.15, 0.15, 0.2] 
     )
 
+    # 1. Historical and Forecast Price Lines
     fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name='Historical Data', mode='lines', line=dict(color='black', width=1.5)), row=1, col=1)
     fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='AI Future Forecast', mode='lines', line=dict(color='blue', width=2)), row=1, col=1)
 
+    # 2. Add the Confidence Interval Cone
+    fig.add_trace(go.Scatter(
+        x=future_forecast['Date'], 
+        y=future_forecast['Upper_Bound'], 
+        name='95% Confidence Upper', 
+        line=dict(color='rgba(0,100,255,0.0)'), # Invisible line
+        showlegend=False
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=future_forecast['Date'], 
+        y=future_forecast['Lower_Bound'], 
+        name='95% Confidence Interval', 
+        line=dict(color='rgba(0,100,255,0.0)'), # Invisible line
+        fill='tonexty', 
+        fillcolor='rgba(0,100,255,0.15)', # Light blue shaded cone
+        showlegend=True
+    ), row=1, col=1)
+
+    # Bollinger Bands
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
 
+    # RSI
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['RSI'], name='RSI', line=dict(color='purple', width=1.5)), row=3, col=1)
     fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,0,0,0.5)", row=3, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,128,0,0.5)", row=3, col=1)
 
+    # MACD
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['MACD'], name='MACD', line=dict(color='blue', width=1.5)), row=4, col=1)
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], name='Signal', line=dict(color='red', width=1.5)), row=4, col=1)
 
@@ -288,13 +359,14 @@ with st.container():
 # -----------------------------------------------------------------------------
 # CSV EXPORT
 # -----------------------------------------------------------------------------
-#st.divider()
-#st.subheader("📥 Export AI Forecast Data")
+st.divider()
+st.subheader("📥 Export AI Forecast Data")
 
-#csv = future_forecast.to_csv(index=False).encode('utf-8')
-#st.download_button(
-#    label="Download Future Forecast as CSV",
-#    data=csv,
-#    file_name=f"{selected_stock}_AI_Forecast.csv",
-#    mime="text/csv",
-#)
+# Update export to include the confidence bounds
+csv = future_forecast.to_csv(index=False).encode('utf-8')
+st.download_button(
+    label="Download Future Forecast as CSV",
+    data=csv,
+    file_name=f"{selected_stock}_AI_Forecast_With_Confidence.csv",
+    mime="text/csv",
+)
