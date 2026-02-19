@@ -72,7 +72,7 @@ def calculate_technicals(df):
 data = calculate_technicals(data)
 
 # -----------------------------------------------------------------------------
-# ML OPTIMIZATION ENGINE (GRID SEARCH WITH LOG TRANSFORM)
+# ML OPTIMIZATION ENGINE (GRID SEARCH)
 # -----------------------------------------------------------------------------
 df_prophet = data[['Date','Close']].rename(columns={"Date": "ds", "Close": "y"})
 
@@ -100,19 +100,19 @@ def optimize_prophet(df):
         train_data = df.iloc[:-test_days].copy()
         test_data = df.iloc[-test_days:].copy()
         
-        # FIX: Apply Log Transform for Training
-        train_data['y'] = np.log(train_data['y'])
-        
         try:
-            m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps, uncertainty_samples=0)
+            # THE FIX: Native multiplicative seasonality prevents exponential blowouts
+            m = Prophet(
+                changepoint_prior_scale=cps, 
+                seasonality_prior_scale=sps, 
+                seasonality_mode='multiplicative', 
+                uncertainty_samples=0
+            )
             m.add_country_holidays(country_name='US')
             m.fit(train_data)
             
             future = m.make_future_dataframe(periods=test_days, freq='B')
             forecast = m.predict(future)
-            
-            # FIX: Reverse the Log Transform for accurate MAPE calculation
-            forecast['yhat'] = np.exp(forecast['yhat'])
             
             eval_df = test_data.merge(forecast[['ds', 'yhat']], on='ds', how='inner')
             mape = np.mean(np.abs((eval_df['y'] - eval_df['yhat']) / eval_df['y'])) * 100
@@ -142,32 +142,25 @@ st.sidebar.info(f"""
 """)
 
 # -----------------------------------------------------------------------------
-# FORECASTING LOGIC (WITH LOG TRANSFORM FIX)
+# FORECASTING LOGIC (MULTIPLICATIVE FIX)
 # -----------------------------------------------------------------------------
 test_days = test_years * 252
 
 train_data = df_prophet.iloc[:-test_days].copy()
 test_data = df_prophet.iloc[-test_days:].copy()
 
-# 1. Transform the actual training data
-train_data_log = train_data.copy()
-train_data_log['y'] = np.log(train_data_log['y'])
-
-m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps)
+# THE FIX: Applied to the final model rendering
+m = Prophet(
+    changepoint_prior_scale=cps, 
+    seasonality_prior_scale=sps,
+    seasonality_mode='multiplicative'
+)
 m.add_country_holidays(country_name='US')
-m.fit(train_data_log)
+m.fit(train_data)
 
 total_periods = test_days + period
 future = m.make_future_dataframe(periods=total_periods, freq='B')
-
-# Prophet outputs the mathematical predictions in log-space
-forecast_log = m.predict(future)
-
-# 2. Transform the predictions AND the confidence intervals back to standard dollars
-forecast = forecast_log.copy()
-forecast['yhat'] = np.exp(forecast_log['yhat'])
-forecast['yhat_lower'] = np.exp(forecast_log['yhat_lower'])
-forecast['yhat_upper'] = np.exp(forecast_log['yhat_upper'])
+forecast = m.predict(future)
 
 # -----------------------------------------------------------------------------
 # CALCULATE ACCURACY METRICS ON TEST DATA
@@ -211,7 +204,6 @@ fig = make_subplots(
 )
 
 # --- ROW 1: PROPHET FORECAST ---
-# NOTE: Using train_data['y'] here so the plot shows standard dollars, not log prices!
 fig.add_trace(go.Scatter(x=train_data['ds'], y=train_data['y'], name='Train Data', mode='markers', marker=dict(color='black', size=4)), row=1, col=1)
 fig.add_trace(go.Scatter(x=test_data['ds'], y=test_data['y'], name='Test Data (Actual)', mode='markers', marker=dict(color='orange', size=5)), row=1, col=1)
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Prophet Prediction', mode='lines', line=dict(color='blue')), row=1, col=1)
@@ -241,7 +233,6 @@ fig.add_trace(go.Scatter(x=extended_data['Date'], y=extended_data['Signal_Line']
 colors = ['green' if val >= 0 else 'red' for val in (extended_data['MACD'] - extended_data['Signal_Line'])]
 fig.add_trace(go.Bar(x=extended_data['Date'], y=(extended_data['MACD'] - extended_data['Signal_Line']), name='Hist', marker_color=colors), row=4, col=1)
 
-# Mark where the future begins in the bottom charts
 fig.add_vline(x=last_actual_date, line_dash="dot", line_color="gray", row=2, col=1)
 fig.add_vline(x=last_actual_date, line_dash="dot", line_color="gray", row=3, col=1)
 fig.add_vline(x=last_actual_date, line_dash="dot", line_color="gray", row=4, col=1)
@@ -259,10 +250,7 @@ st.divider()
 st.subheader(f"🔍 {selected_stock} Forecast Components")
 st.markdown("Breakdown of the overall trajectory, recurring seasonal patterns, and holiday impacts discovered by the model.")
 
-# 
-# We MUST pass the forecast_log dataframe here because Prophet's internal model 
-# state expects the data to match the mathematical scale it was trained on.
-fig_comp = plot_components_plotly(m, forecast_log)
+fig_comp = plot_components_plotly(m, forecast)
 st.plotly_chart(fig_comp, use_container_width=True)
 
 # -----------------------------------------------------------------------------
