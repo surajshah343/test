@@ -100,14 +100,11 @@ def engineer_features(df):
     
     return df
 
-# Create raw dataset, then drop NaNs ONLY for the ML training set
 all_data_engineered = engineer_features(data)
 
-# Features are now strictly relative distances, not absolute prices
 features = ['Lag_1_Ret', 'Lag_2_Ret', 'SMA_10_Pct', 'SMA_20_Pct', 'MACD_Pct', 'RSI', 'DayOfYear', 'Month']
 target = 'Target_Return'
 
-# ML dataset safe for training (drops the final row where Target_Return is NaN)
 full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 
 # -----------------------------------------------------------------------------
@@ -119,7 +116,6 @@ def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predi
     predictions = []
     
     for date_val in dates_to_predict:
-        # Calculate features on the buffer. 
         current_features_df = engineer_features(buffer) 
         last_row = current_features_df.iloc[-1]
         
@@ -140,36 +136,36 @@ def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predi
         predictions.append({'Date': date_val, 'Close': new_close})
         
         new_row = pd.DataFrame({'Date': [date_val], 'Close': [new_close]})
-        # Keep 300 days to ensure EMA mathematically converges and doesn't distort
         buffer = pd.concat([buffer, new_row], ignore_index=True).tail(300) 
         
     return pd.DataFrame(predictions)
 
 # -----------------------------------------------------------------------------
-# ML OPTIMIZATION ENGINE
+# ML OPTIMIZATION ENGINE (CACHED)
 # -----------------------------------------------------------------------------
-def optimize_xgboost_horizon():
+@st.cache_data(ttl=3600, show_spinner=False)
+def optimize_xgboost_horizon(ticker, ml_df, raw_df):
+    """Grid searches for the optimal test window length. Cached per ticker to speed up UI."""
     test_years_grid = [1, 2, 3, 4]
     best_mape = float('inf')
     best_ty = 1
     best_test_forecast = None
     
-    total_days = len(full_ml_data)
+    total_days = len(ml_df)
     
     for ty in test_years_grid:
         test_days_iter = ty * 252
         if total_days <= test_days_iter + 252:
             continue
             
-        train_iter = full_ml_data.iloc[:-test_days_iter].copy()
-        test_iter = full_ml_data.iloc[-test_days_iter:].copy()
+        train_iter = ml_df.iloc[:-test_days_iter].copy()
+        test_iter = ml_df.iloc[-test_days_iter:].copy()
         
         model_iter = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
         model_iter.fit(train_iter[features], train_iter[target])
         
-        # Pull raw price buffer exactly up to the split date
         split_date = train_iter['Date'].iloc[-1]
-        start_buffer = data[data['Date'] <= split_date][['Date', 'Close']].tail(300).copy()
+        start_buffer = raw_df[raw_df['Date'] <= split_date][['Date', 'Close']].tail(300).copy()
         test_dates = test_iter['Date'].tolist()
         
         forecast_iter = generate_autoregressive_forecast(model_iter, start_buffer, test_dates)
@@ -184,8 +180,8 @@ def optimize_xgboost_horizon():
             
     return best_ty, best_mape, best_test_forecast
 
-with st.spinner("Running Grid Search to find optimal Test Horizon..."):
-    optimal_test_years, final_mape, test_forecast = optimize_xgboost_horizon()
+with st.spinner("Running Grid Search to find optimal Test Horizon (Cached)..."):
+    optimal_test_years, final_mape, test_forecast = optimize_xgboost_horizon(selected_stock, full_ml_data, data)
 
 st.sidebar.divider()
 st.sidebar.subheader("🤖 Auto-ML Tuning Active")
@@ -206,24 +202,49 @@ final_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5
 with st.spinner("Training Final Model and Generating Future Forecast..."):
     final_model.fit(train_data[features], train_data[target])
     
-    # Grab the true current day from raw data to seed the future forecast
+    # -------------------------------------------------------------------------
+    # FEATURE IMPORTANCE VISUALIZATION (SIDEBAR)
+    # -------------------------------------------------------------------------
+    importances = final_model.feature_importances_
+    importance_df = pd.DataFrame({'Feature': features, 'Importance': importances})
+    importance_df = importance_df.sort_values(by='Importance', ascending=True)
+
+    fig_imp = go.Figure(go.Bar(
+        x=importance_df['Importance'],
+        y=importance_df['Feature'],
+        orientation='h',
+        marker_color='teal',
+        opacity=0.8
+    ))
+    fig_imp.update_layout(
+        title="Model Feature Importance",
+        title_font_size=14,
+        margin=dict(l=0, r=0, t=30, b=0),
+        height=250,
+        xaxis_title="Relative Importance Weight",
+        yaxis_title=None,
+        plot_bgcolor='white',
+        paper_bgcolor='white'
+    )
+    fig_imp.update_xaxes(showgrid=True, gridcolor='rgba(230,230,230,0.5)')
+    
+    st.sidebar.divider()
+    st.sidebar.plotly_chart(fig_imp, use_container_width=True, config={'displayModeBar': False})
+    
+    # Generate the actual forecast
     future_start_buffer = data[['Date', 'Close']].tail(300).copy()
     last_actual_date = future_start_buffer['Date'].iloc[-1]
     
-    # Now perfectly aligns to tomorrow
     future_dates = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=forecast_days, freq='B')
-    
     future_forecast = generate_autoregressive_forecast(final_model, future_start_buffer, future_dates)
 
-# Generate smooth plotting data 
 all_forecasts = pd.concat([test_forecast, future_forecast], ignore_index=True)
 combined_price_data = pd.concat([train_data[['Date', 'Close']], all_forecasts[['Date', 'Close']]], ignore_index=True)
 plot_data = engineer_features(combined_price_data)
 
 # -----------------------------------------------------------------------------
-# SEASONALITY ANALYSIS & DASHBOARD 
+# SEASONALITY ANALYSIS 
 # -----------------------------------------------------------------------------
-# (Visuals remain the same)
 st.subheader("🗓️ Historical Seasonality Analysis")
 st.markdown("Average performance historically grouped by the day of the week and month of the year.")
 
@@ -254,50 +275,81 @@ with col_s2:
 
 st.divider()
 
+# -----------------------------------------------------------------------------
+# MASTER DASHBOARD VISUALIZATION
+# -----------------------------------------------------------------------------
 st.subheader("📈 Unified Technical & Forecast Dashboard")
 
-fig = make_subplots(
-    rows=4, cols=1, 
-    shared_xaxes=True, 
-    vertical_spacing=0.05, 
-    subplot_titles=(f'{selected_stock} XGBoost Forecast & Price', 'Bollinger Bands', 'RSI', 'MACD'),
-    row_heights=[0.4, 0.2, 0.2, 0.2]
-)
+with st.container():
+    fig = make_subplots(
+        rows=4, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.04, 
+        subplot_titles=(
+            f'{selected_stock} XGBoost Forecast & Price', 
+            'Bollinger Bands', 
+            'RSI', 
+            'MACD'
+        ),
+        row_heights=[0.5, 0.15, 0.15, 0.2] 
+    )
 
-# ROW 1: PRICE & FORECAST
-fig.add_trace(go.Scatter(x=train_data['Date'], y=train_data['Close'], name='Train Data', mode='lines', line=dict(color='black')), row=1, col=1)
-fig.add_trace(go.Scatter(x=test_data['Date'], y=test_data['Close'], name='Test Data (Actual)', mode='lines', line=dict(color='rgba(0,0,0,0.3)')), row=1, col=1)
-fig.add_trace(go.Scatter(x=test_forecast['Date'], y=test_forecast['Close'], name='Test Forecast (Simulated)', mode='lines', line=dict(color='orange', dash='dot')), row=1, col=1)
-fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='Future Forecast', mode='lines', line=dict(color='blue', width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=train_data['Date'], y=train_data['Close'], name='Train Data', mode='lines', line=dict(color='black', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=test_data['Date'], y=test_data['Close'], name='Test Data (Actual)', mode='lines', line=dict(color='rgba(0,0,0,0.3)', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=test_forecast['Date'], y=test_forecast['Close'], name='Test Forecast (Simulated)', mode='lines', line=dict(color='orange', dash='dot', width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='Future Forecast', mode='lines', line=dict(color='blue', width=2)), row=1, col=1)
 
-split_date = train_data['Date'].iloc[-1]
-fig.add_vline(x=split_date, line_dash="dash", line_color="gray", row=1, col=1)
-fig.add_annotation(x=split_date, y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="gray"), xanchor="left", row=1, col=1)
+    split_date = train_data['Date'].iloc[-1]
+    fig.add_vline(x=split_date, line_dash="dash", line_color="gray", row=1, col=1)
+    fig.add_annotation(x=split_date, y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="gray", size=10), xanchor="left", row=1, col=1)
 
-# ROW 2: BOLLINGER BANDS
-fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
-fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
-fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
 
-# ROW 3: RSI
-fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['RSI'], name='RSI', line=dict(color='purple')), row=3, col=1)
-fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['RSI'], name='RSI', line=dict(color='purple', width=1.5)), row=3, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,0,0,0.5)", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,128,0,0.5)", row=3, col=1)
 
-# ROW 4: MACD
-fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['MACD'], name='MACD', line=dict(color='blue')), row=4, col=1)
-fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], name='Signal', line=dict(color='red')), row=4, col=1)
+    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['MACD'], name='MACD', line=dict(color='blue', width=1.5)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], name='Signal', line=dict(color='red', width=1.5)), row=4, col=1)
 
-macd_hist = plot_data['MACD'] - plot_data['Signal_Line']
-macd_colors = ['green' if val >= 0 else 'red' for val in macd_hist]
-fig.add_trace(go.Bar(x=plot_data['Date'], y=macd_hist, name='Hist', marker_color=macd_colors), row=4, col=1)
+    macd_hist = plot_data['MACD'] - plot_data['Signal_Line']
+    macd_colors = ['rgba(0,128,0,0.6)' if val >= 0 else 'rgba(255,0,0,0.6)' for val in macd_hist]
+    fig.add_trace(go.Bar(x=plot_data['Date'], y=macd_hist, name='Hist', marker_color=macd_colors), row=4, col=1)
 
-# TODAY LINES
-for r in range(1, 5):
-    fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=r, col=1)
-fig.add_annotation(x=last_actual_date, y=1.05, yref="paper", text="Today", showarrow=False, font=dict(color="green"), xanchor="left", row=1, col=1)
+    for r in range(1, 5):
+        fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", opacity=0.6, row=r, col=1)
+    fig.add_annotation(x=last_actual_date, y=1.05, yref="paper", text="Today", showarrow=False, font=dict(color="green", size=10), xanchor="left", row=1, col=1)
 
-fig.update_layout(height=1200, showlegend=True)
-fig.update_xaxes(rangeslider_visible=False)
+    fig.update_layout(
+        height=900, 
+        showlegend=True,
+        legend=dict(
+            orientation="h", 
+            yanchor="bottom",
+            y=1.02, 
+            xanchor="right",
+            x=1,
+            font=dict(size=10)
+        ),
+        hovermode="x unified", 
+        margin=dict(l=10, r=10, t=50, b=10), 
+        plot_bgcolor='white', 
+        paper_bgcolor='white'
+    )
+    
+    fig.update_xaxes(
+        rangeslider_visible=False, 
+        showgrid=True, 
+        gridwidth=1, 
+        gridcolor='rgba(230,230,230,0.5)'
+    )
+    fig.update_yaxes(
+        showgrid=True, 
+        gridwidth=1, 
+        gridcolor='rgba(230,230,230,0.5)',
+        zeroline=False 
+    )
 
-st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
