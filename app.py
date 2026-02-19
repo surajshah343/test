@@ -7,7 +7,7 @@ from plotly.subplots import make_subplots
 from plotly import graph_objs as go
 import pandas as pd
 import numpy as np
-import itertools # NEW: Required for the ML Grid Search
+import itertools 
 
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
@@ -25,7 +25,6 @@ st.sidebar.header("Configuration")
 ticker_input = st.sidebar.text_input("Enter Ticker Symbol:", value="NVDA")
 selected_stock = ticker_input.upper()
 
-# Keep only the future horizon slider for the user
 n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 period = n_years * 252 
 
@@ -73,17 +72,15 @@ def calculate_technicals(df):
 data = calculate_technicals(data)
 
 # -----------------------------------------------------------------------------
-# ML OPTIMIZATION ENGINE (GRID SEARCH)
+# ML OPTIMIZATION ENGINE (GRID SEARCH WITH LOG TRANSFORM)
 # -----------------------------------------------------------------------------
 df_prophet = data[['Date','Close']].rename(columns={"Date": "ds", "Close": "y"})
 
 @st.cache_data(show_spinner=False)
 def optimize_prophet(df):
-    # 1. Define the Hyperparameter Grid Search Space
     cps_grid = [0.01, 0.05, 0.1, 0.2]
     sps_grid = [0.1, 1.0, 5.0, 10.0]
     
-    # 2. Dynamically find the maximum valid test years for this specific ticker
     total_days = len(df)
     max_test_years = min(4, int((total_days - 252) / 252)) 
     
@@ -95,23 +92,27 @@ def optimize_prophet(df):
     best_mape = float('inf')
     best_params = {'cps': 0.05, 'sps': 10.0, 'test_years': 1}
     
-    # 3. Brute-force through all combinations to find the mathematical best fit
     for cps, sps, ty in itertools.product(cps_grid, sps_grid, test_years_grid):
         test_days = ty * 252
         if len(df) <= test_days + 252:
             continue
             
-        train_data = df.iloc[:-test_days]
-        test_data = df.iloc[-test_days:]
+        train_data = df.iloc[:-test_days].copy()
+        test_data = df.iloc[-test_days:].copy()
+        
+        # FIX: Apply Log Transform for Training
+        train_data['y'] = np.log(train_data['y'])
         
         try:
-            # uncertainty_samples=0 dramatically speeds up the ML training loop
             m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps, uncertainty_samples=0)
             m.add_country_holidays(country_name='US')
             m.fit(train_data)
             
             future = m.make_future_dataframe(periods=test_days, freq='B')
             forecast = m.predict(future)
+            
+            # FIX: Reverse the Log Transform for accurate MAPE calculation
+            forecast['yhat'] = np.exp(forecast['yhat'])
             
             eval_df = test_data.merge(forecast[['ds', 'yhat']], on='ds', how='inner')
             mape = np.mean(np.abs((eval_df['y'] - eval_df['yhat']) / eval_df['y'])) * 100
@@ -124,7 +125,6 @@ def optimize_prophet(df):
             
     return best_params
 
-# Run the optimizer
 with st.spinner(f"Running ML Grid Search Optimization for {selected_stock}..."):
     best_params = optimize_prophet(df_prophet)
 
@@ -132,7 +132,6 @@ cps = best_params['cps']
 sps = best_params['sps']
 test_years = best_params['test_years']
 
-# Update UI with Read-Only Auto-Tuned Parameters
 st.sidebar.divider()
 st.sidebar.subheader("🤖 Auto-ML Tuning Active")
 st.sidebar.markdown(f"Optimal parameters found for **{selected_stock}**:")
@@ -143,21 +142,32 @@ st.sidebar.info(f"""
 """)
 
 # -----------------------------------------------------------------------------
-# FORECASTING LOGIC (WITH OPTIMIZED PARAMS)
+# FORECASTING LOGIC (WITH LOG TRANSFORM FIX)
 # -----------------------------------------------------------------------------
 test_days = test_years * 252
 
-train_data = df_prophet.iloc[:-test_days]
-test_data = df_prophet.iloc[-test_days:]
+train_data = df_prophet.iloc[:-test_days].copy()
+test_data = df_prophet.iloc[-test_days:].copy()
 
-# Build the final model (uncertainty_samples restored to default for charting)
+# 1. Transform the actual training data
+train_data_log = train_data.copy()
+train_data_log['y'] = np.log(train_data_log['y'])
+
 m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps)
 m.add_country_holidays(country_name='US')
-m.fit(train_data)
+m.fit(train_data_log)
 
 total_periods = test_days + period
 future = m.make_future_dataframe(periods=total_periods, freq='B')
-forecast = m.predict(future)
+
+# Prophet outputs the mathematical predictions in log-space
+forecast_log = m.predict(future)
+
+# 2. Transform the predictions AND the confidence intervals back to standard dollars
+forecast = forecast_log.copy()
+forecast['yhat'] = np.exp(forecast_log['yhat'])
+forecast['yhat_lower'] = np.exp(forecast_log['yhat_lower'])
+forecast['yhat_upper'] = np.exp(forecast_log['yhat_upper'])
 
 # -----------------------------------------------------------------------------
 # CALCULATE ACCURACY METRICS ON TEST DATA
@@ -180,18 +190,13 @@ st.divider()
 # -----------------------------------------------------------------------------
 # EXTEND TECHNICAL INDICATORS INTO THE FUTURE
 # -----------------------------------------------------------------------------
-# 1. Grab historical facts
 historical_df = data[['Date', 'Close']].copy()
 
-# 2. Grab strictly future predictions (dates beyond today)
 last_actual_date = historical_df['Date'].max()
 future_df = forecast[forecast['ds'] > last_actual_date][['ds', 'yhat']].copy()
 future_df = future_df.rename(columns={'ds': 'Date', 'yhat': 'Close'})
 
-# 3. Stitch them together to create one continuous timeline
 extended_data = pd.concat([historical_df, future_df], ignore_index=True)
-
-# 4. Run the complex indicator math on the seamlessly stitched timeline
 extended_data = calculate_technicals(extended_data)
 
 # -----------------------------------------------------------------------------
@@ -206,6 +211,7 @@ fig = make_subplots(
 )
 
 # --- ROW 1: PROPHET FORECAST ---
+# NOTE: Using train_data['y'] here so the plot shows standard dollars, not log prices!
 fig.add_trace(go.Scatter(x=train_data['ds'], y=train_data['y'], name='Train Data', mode='markers', marker=dict(color='black', size=4)), row=1, col=1)
 fig.add_trace(go.Scatter(x=test_data['ds'], y=test_data['y'], name='Test Data (Actual)', mode='markers', marker=dict(color='orange', size=5)), row=1, col=1)
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Prophet Prediction', mode='lines', line=dict(color='blue')), row=1, col=1)
@@ -253,13 +259,16 @@ st.divider()
 st.subheader(f"🔍 {selected_stock} Forecast Components")
 st.markdown("Breakdown of the overall trajectory, recurring seasonal patterns, and holiday impacts discovered by the model.")
 
-fig_comp = plot_components_plotly(m, forecast)
+# 
+# We MUST pass the forecast_log dataframe here because Prophet's internal model 
+# state expects the data to match the mathematical scale it was trained on.
+fig_comp = plot_components_plotly(m, forecast_log)
 st.plotly_chart(fig_comp, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # RAW DATA TAB
 # -----------------------------------------------------------------------------
-#with st.expander("📝 View Raw Historical Data"):
-#    st.dataframe(data.tail(50))
-#    csv = data.to_csv(index=False).encode('utf-8')
-#    st.download_button("Download Historical CSV", data=csv, file_name=f"{selected_stock}_history.csv", mime="text/csv")
+with st.expander("📝 View Raw Historical Data"):
+    st.dataframe(data.tail(50))
+    csv = data.to_csv(index=False).encode('utf-8')
+    st.download_button("Download Historical CSV", data=csv, file_name=f"{selected_stock}_history.csv", mime="text/csv")
