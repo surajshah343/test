@@ -14,7 +14,7 @@ from sklearn.model_selection import RandomizedSearchCV
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
 # -----------------------------------------------------------------------------
-START = "1995-01-01" 
+START = "2015-01-01" 
 TODAY = date.today().strftime("%Y-%m-%d")
 
 os.makedirs("saved_models", exist_ok=True)
@@ -36,7 +36,6 @@ n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 forecast_days = n_years * 252 
 n_simulations = st.sidebar.slider('Monte Carlo Paths:', 0, 50, value=20)
 
-# Toggle added here - calculation is now cached below to prevent re-runs
 show_paths = st.sidebar.toggle("Show Individual Sim Paths", value=True)
 
 MODEL_FILE = f"saved_models/{selected_stock}_continuous_model.json"
@@ -109,22 +108,8 @@ target = 'Target_Residual'
 full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 
 # -----------------------------------------------------------------------------
-# EVALUATION & TRAINING
+# TRAINING
 # -----------------------------------------------------------------------------
-split_idx = int(len(full_ml_data) * 0.8)
-train_eval, test_eval = full_ml_data.iloc[:split_idx], full_ml_data.iloc[split_idx:]
-split_date = test_eval['Date'].iloc[0]
-
-quick_eval_model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
-quick_eval_model.fit(train_eval[features], train_eval[target])
-eval_preds = quick_eval_model.predict(test_eval[features])
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("📊 Accuracy Metrics")
-c1, c2 = st.sidebar.columns(2)
-c1.metric("MAE", f"{mean_absolute_error(test_eval[target], eval_preds):.4f}")
-c2.metric("RMSE", f"{np.sqrt(mean_squared_error(test_eval[target], eval_preds)):.4f}")
-
 final_model = xgb.XGBRegressor()
 if not os.path.exists(MODEL_FILE):
     tuner = RandomizedSearchCV(xgb.XGBRegressor(random_state=42), {'max_depth': [3, 5], 'n_estimators': [100]}, n_iter=2, cv=2)
@@ -136,7 +121,7 @@ else:
     final_model.load_model(MODEL_FILE)
 
 # -----------------------------------------------------------------------------
-# CACHED FORECAST GENERATION (Includes Progress Bar)
+# CACHED FORECAST GENERATION (With Progress Bar)
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def generate_forecast_cached(_model, _historical_df, _dates, _num_sims):
@@ -152,10 +137,7 @@ def generate_forecast_cached(_model, _historical_df, _dates, _num_sims):
     l_gain, l_loss = records[-1]['Avg_Gain'], records[-1]['Avg_Loss']
     
     preds = []
-    
-    # Progress Bar setup
-    prog_text = "Executing AI Recursive Forecast..."
-    my_bar = st.progress(0, text=prog_text)
+    progress_bar = st.progress(0, text="Initializing AI Forecast...")
     
     for i, date_val in enumerate(_dates):
         c_price = records[-1]['Close']
@@ -191,10 +173,10 @@ def generate_forecast_cached(_model, _historical_df, _dates, _num_sims):
         records.append(rec); preds.append(rec)
         if len(records) > 60: records.pop(0)
         
-        # Update progress
-        my_bar.progress((i + 1) / len(_dates), text=prog_text)
-    
-    my_bar.empty()
+        if i % 10 == 0 or i == len(_dates) - 1:
+            progress_bar.progress((i + 1) / len(_dates), text=f"Processing Day {i+1} of {len(_dates)}...")
+            
+    progress_bar.empty()
     return pd.DataFrame(preds), mc_paths
 
 # Execution
@@ -205,6 +187,8 @@ f_forecast, mc_paths = generate_forecast_cached(final_model, data, future_dates,
 # PLOTTING
 # -----------------------------------------------------------------------------
 plot_data = engineer_features(pd.concat([data, f_forecast], ignore_index=True))
+split_date_idx = int(len(full_ml_data) * 0.8)
+split_date = full_ml_data.iloc[split_date_idx]['Date']
 
 fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.4, 0.2, 0.2, 0.2],
                     subplot_titles=('Institutional Forecast', 'Bollinger Bands (Price vs Volatility)', 'RSI (Momentum)', 'MACD (Trend)'))
@@ -233,10 +217,42 @@ fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], line=d
 colors = ['green' if val >= 0 else 'red' for val in plot_data['MACD_Hist']]
 fig.add_trace(go.Bar(x=plot_data['Date'], y=plot_data['MACD_Hist'], marker_color=colors, name='MACD Histogram'), row=4, col=1)
 
-for row, txt in [(1, "Forecast Info"), (2, "Volatility Info"), (3, "Momentum Info"), (4, "Trend Info")]:
+for row, txt in [(1, "Forecast Main"), (2, "Bollinger Bands"), (3, "RSI Momentum"), (4, "MACD Trend")]:
     fig.add_annotation(x=0.01, y=0.95, xref=f"x{row if row > 1 else ''} domain", yref=f"y{row if row > 1 else ''} domain",
                        text="<b>?</b>", showarrow=False, bgcolor="black", font=dict(color="white"), hovertext=txt)
 
 fig.update_yaxes(range=[0, data['Close'].iloc[-1] * 3], row=1, col=1)
 fig.update_layout(height=1100, template='plotly_white', hovermode='x unified', legend=dict(orientation="h", y=1.02))
 st.plotly_chart(fig, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# PRICE TARGET SUMMARY TABLE
+# -----------------------------------------------------------------------------
+st.markdown("### 🎯 Institutional Price Targets")
+cur_price = data['Close'].iloc[-1]
+
+# Extract targets for key milestones
+targets = []
+milestones = {
+    "6 Months": 126,
+    "1 Year": 252,
+    "2 Years": 504,
+    "4 Years": 1008
+}
+
+for label, day_idx in milestones.items():
+    if day_idx <= len(f_forecast):
+        row = f_forecast.iloc[day_idx - 1]
+        proj_p = row['Close']
+        roi = ((proj_p / cur_price) - 1) * 100
+        targets.append({
+            "Horizon": label,
+            "Target Date": row['Date'].strftime('%Y-%m-%d'),
+            "Projected Price": f"${proj_p:.2f}",
+            "Lower Bound (95%)": f"${row['Lower_Bound']:.2f}",
+            "Upper Bound (95%)": f"${row['Upper_Bound']:.2f}",
+            "Potential ROI": f"{roi:+.2f}%"
+        })
+
+if targets:
+    st.table(pd.DataFrame(targets))
