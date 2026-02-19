@@ -9,16 +9,17 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
+from sklearn.model_selection import RandomizedSearchCV
 
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
 # -----------------------------------------------------------------------------
-START = "1999-01-01" 
+START = "1995-01-01" 
 TODAY = date.today().strftime("%Y-%m-%d")
 
 os.makedirs("saved_models", exist_ok=True)
 
-st.set_page_config(page_title="Pro Dashboard", layout="wide")
+st.set_page_config(page_title="AI Pro Dashboard", layout="wide")
 st.title('🧠 Continuous Learning AI Dashboard by S. Shah')
 
 st.sidebar.header("Configuration")
@@ -68,30 +69,33 @@ if data is None or data.empty:
 def engineer_features(df):
     df = df.copy()
     
+    # Time Features
     df['DayOfYear'] = df['Date'].dt.dayofyear
     df['Month'] = df['Date'].dt.month
     
+    # Technical Indicators
     df['SMA_10'] = df['Close'].rolling(window=10).mean()
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['Std_Dev'] = df['Close'].rolling(window=20).std()
     df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
     df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
     
+    # State tracking metrics needed for loop consistency
     df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = df['EMA_12'] - df['EMA_26']
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     
+    # Corrected Wilder's RSI
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    
     df['Avg_Gain'] = gain.ewm(alpha=1/14, adjust=False).mean()
     df['Avg_Loss'] = loss.ewm(alpha=1/14, adjust=False).mean()
-    
     rs = df['Avg_Gain'] / df['Avg_Loss'].replace(0, np.nan)
     df['RSI'] = np.where(df['Avg_Loss'] == 0, 100, 100 - (100 / (1 + rs)))
     
+    # Returns & Volatility
     df['Lag_1_Ret'] = df['Close'] / df['Close'].shift(1) - 1
     df['Lag_2_Ret'] = df['Close'] / df['Close'].shift(2) - 1
     df['SMA_10_Pct'] = df['SMA_10'] / df['Close'] - 1
@@ -99,6 +103,7 @@ def engineer_features(df):
     df['MACD_Pct'] = df['MACD'] / df['Close']
     df['Vol_20'] = df['Lag_1_Ret'].rolling(window=20).std()
     
+    # Target Construction: Prediction of RESIDUALS (Alpha) over Drift
     df['Daily_Return'] = df['Close'].pct_change()
     df['Rolling_Drift'] = df['Daily_Return'].rolling(window=50).mean()
     df['Target_Return'] = df['Daily_Return'].shift(-1)
@@ -116,343 +121,186 @@ full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 # OUT-OF-SAMPLE EVALUATION (CHRONOLOGICAL SPLIT)
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
-st.sidebar.subheader("📊 Model Performance (Holdout Set)")
+st.sidebar.subheader("📊 Performance & Accuracy")
 
 split_idx = int(len(full_ml_data) * 0.8)
 train_eval = full_ml_data.iloc[:split_idx]
 test_eval = full_ml_data.iloc[split_idx:]
 split_date = test_eval['Date'].iloc[0] 
 
-eval_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
-eval_model.fit(train_eval[features], train_eval[target])
+# Simple fast eval for metrics display
+quick_eval_model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
+quick_eval_model.fit(train_eval[features], train_eval[target])
+eval_preds = quick_eval_model.predict(test_eval[features])
 
-predictions = eval_model.predict(test_eval[features])
-actuals = test_eval[target]
+mae = mean_absolute_error(test_eval[target], eval_preds)
+rmse = np.sqrt(mean_squared_error(test_eval[target], eval_preds))
+mape = mean_absolute_percentage_error(test_eval[target] + 1e-8, eval_preds + 1e-8)
 
-mae = mean_absolute_error(actuals, predictions)
-rmse = np.sqrt(mean_squared_error(actuals, predictions))
-mape = mean_absolute_percentage_error(actuals + 1e-8, predictions + 1e-8)
-
-col1, col2 = st.sidebar.columns(2)
-# Added informative tooltips using Streamlit's native 'help' parameter
-col1.metric("MAE (Residual)", f"{mae:.4f}", help="Mean Absolute Error: The average absolute difference between the AI's predicted residual and the actual market residual. A lower value indicates higher predictive accuracy.")
-col2.metric("RMSE", f"{rmse:.4f}", help="Root Mean Squared Error: Similar to MAE, but heavily penalizes larger errors. Compare this to historical standard deviation to gauge performance.")
-st.sidebar.metric("MAPE (Residual Volatility)", f"{mape:.2%}", help="Mean Absolute Percentage Error: Shows the error as a percentage. Note: Because stock residuals hover near zero, this value can artificially spike, so evaluate it alongside MAE.")
-st.sidebar.caption("Evaluated chronologically on the most recent 20% of historical data.")
+c1, c2 = st.sidebar.columns(2)
+c1.metric("MAE", f"{mae:.4f}", help="Mean Absolute Error of residuals.")
+c2.metric("RMSE", f"{rmse:.4f}", help="Root Mean Squared Error.")
+st.sidebar.metric("MAPE (Residual)", f"{mape:.2%}", help="Percentage error on predicted alpha.")
 
 # -----------------------------------------------------------------------------
-# CONTINUOUS LEARNING ENGINE (TRAINING ON ALL DATA FOR FUTURE FORECAST)
+# AUTO-DEEP LEARN ENGINE (OPTIMIZATION & CONTINUOUS LEARNING)
 # -----------------------------------------------------------------------------
-final_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
 is_new_model = not os.path.exists(MODEL_FILE)
+latest_available_date = full_ml_data['Date'].max().strftime("%Y-%m-%d")
 
-trainable_data = full_ml_data.copy() 
-latest_available_date = trainable_data['Date'].max().strftime("%Y-%m-%d")
+# Search grid for the Auto-Tuning engine
+param_grid = {
+    'max_depth': [3, 5, 7],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'n_estimators': [100, 200],
+    'subsample': [0.8, 0.9]
+}
+
+final_model = xgb.XGBRegressor()
 
 if is_new_model:
-    st.sidebar.warning("⚠️ No saved brain found. Training baseline model...")
-    with st.spinner("Compiling initial AI brain..."):
-        final_model.fit(trainable_data[features], trainable_data[target])
+    st.sidebar.warning("⚠️ Training & Auto-Tuning Initial Model...")
+    with st.spinner("Executing Hyperparameter Search to minimize error..."):
+        base_xgb = xgb.XGBRegressor(random_state=42)
+        tuner = RandomizedSearchCV(
+            estimator=base_xgb, 
+            param_distributions=param_grid, 
+            n_iter=8, 
+            scoring='neg_mean_absolute_error', 
+            cv=3, 
+            random_state=42
+        )
+        tuner.fit(full_ml_data[features], full_ml_data[target])
+        final_model = tuner.best_estimator_
         final_model.save_model(MODEL_FILE)
-        
         with open(META_FILE, 'w') as f:
-            json.dump({"last_trained_date": latest_available_date}, f)
+            json.dump({"last_trained_date": latest_available_date, "params": tuner.best_params_}, f)
+        st.sidebar.success("✅ Brain Tuned & Saved!")
 else:
     final_model.load_model(MODEL_FILE)
-    
-    last_trained_date = "1990-01-01"
-    if os.path.exists(META_FILE):
-        with open(META_FILE, 'r') as f:
-            meta = json.load(f)
-            last_trained_date = meta.get("last_trained_date", "1990-01-01")
+    with open(META_FILE, 'r') as f:
+        meta = json.load(f)
+        last_trained_date = meta.get("last_trained_date", "1990-01-01")
     
     if latest_available_date > last_trained_date:
-        new_data = trainable_data[trainable_data['Date'] > last_trained_date]
+        new_data = full_ml_data[full_ml_data['Date'] > last_trained_date]
         if not new_data.empty:
-            with st.spinner("Learning from recent market data..."):
+            with st.spinner("Continuously learning from new data..."):
                 final_model.fit(new_data[features], new_data[target], xgb_model=MODEL_FILE)
                 final_model.save_model(MODEL_FILE)
+                meta['last_trained_date'] = latest_available_date
                 with open(META_FILE, 'w') as f:
-                    json.dump({"last_trained_date": latest_available_date}, f)
+                    json.dump(meta, f)
 
 # -----------------------------------------------------------------------------
-# INSTITUTIONAL AUTOREGRESSIVE FORECAST (GBM + ML RESIDUALS)
+# STOCHASTIC AUTOREGRESSIVE FORECAST (GBM + AI ALPHA)
 # -----------------------------------------------------------------------------
-def generate_autoregressive_forecast(trained_model, historical_df, start_buffer, dates_to_predict, num_sims):
-    engineered_hist = engineer_features(historical_df)
-    records = engineered_hist.tail(30).to_dict('records')
-    predictions = []
+def generate_forecast(trained_model, historical_df, dates_to_predict, num_sims):
+    # State tracking for recursive forecasting
+    hist_eng = engineer_features(historical_df)
+    records = hist_eng.tail(30).to_dict('records')
     
-    long_term_returns = historical_df['Close'].pct_change().dropna().tail(504) 
-    mu = long_term_returns.mean()
-    sigma = long_term_returns.std()
-    
+    returns_tail = historical_df['Close'].pct_change().dropna().tail(504)
+    mu = returns_tail.mean()
+    sigma = returns_tail.std()
     daily_drift = mu - (0.5 * sigma**2)
     
-    base_close = records[-1]['Close']
     mc_paths = {f'Sim_{i}': [] for i in range(num_sims)}
-    current_mc_prices = {f'Sim_{i}': base_close for i in range(num_sims)}
+    current_mc_prices = {f'Sim_{i}': records[-1]['Close'] for i in range(num_sims)}
     
-    last_ema_12 = records[-1]['EMA_12']
-    last_ema_26 = records[-1]['EMA_26']
-    last_avg_gain = records[-1]['Avg_Gain']
-    last_avg_loss = records[-1]['Avg_Loss']
+    # Stateful technical values
+    l_ema12, l_ema26 = records[-1]['EMA_12'], records[-1]['EMA_26']
+    l_gain, l_loss = records[-1]['Avg_Gain'], records[-1]['Avg_Loss']
     
+    preds = []
     for i, date_val in enumerate(dates_to_predict):
-        last_rec = records[-1]
-        prev_rec = records[-2]
+        curr_rec = records[-1]
+        c_price = curr_rec['Close']
         
-        current_close = last_rec['Close']
-        closes = [r['Close'] for r in records[-20:]]
+        # Proper Technical Update
+        l_ema12 = (c_price - l_ema12) * (2/13) + l_ema12
+        l_ema26 = (c_price - l_ema26) * (2/27) + l_ema26
+        macd = l_ema12 - l_ema26
         
-        lag_1_ret = current_close / prev_rec['Close'] - 1
-        lag_2_ret = current_close / records[-3]['Close'] - 1
+        diff = c_price - records[-2]['Close']
+        g, l = (diff, 0) if diff > 0 else (0, -diff)
+        l_gain = g * (1/14) + l_gain * (13/14)
+        l_loss = l * (1/14) + l_loss * (13/14)
+        rsi = 100 if l_loss == 0 else 100 - (100 / (1 + (l_gain/l_loss)))
         
-        sma_10 = np.mean([r['Close'] for r in records[-10:]])
-        sma_20 = np.mean(closes)
+        vol_20 = np.std([records[x]['Close']/records[x-1]['Close']-1 for x in range(-20, 0)], ddof=1)
         
-        alpha_12 = 2 / (12 + 1)
-        alpha_26 = 2 / (26 + 1)
-        
-        last_ema_12 = (current_close - last_ema_12) * alpha_12 + last_ema_12
-        last_ema_26 = (current_close - last_ema_26) * alpha_26 + last_ema_26
-        macd = last_ema_12 - last_ema_26
-        
-        delta = current_close - prev_rec['Close']
-        gain = delta if delta > 0 else 0
-        loss = -delta if delta < 0 else 0
-        
-        last_avg_gain = gain * (1/14) + last_avg_gain * (1 - 1/14)
-        last_avg_loss = loss * (1/14) + last_avg_loss * (1 - 1/14)
-        
-        if last_avg_loss == 0:
-            rsi = 100
-        else:
-            rs = last_avg_gain / last_avg_loss
-            rsi = 100 - (100 / (1 + rs))
-        
-        recent_returns = [records[idx]['Close'] / records[idx-1]['Close'] - 1 for idx in range(-20, 0)]
-        vol_20 = np.std(recent_returns, ddof=1)
-        
-        X_pred = pd.DataFrame({
-            'Lag_1_Ret': [lag_1_ret],
-            'Lag_2_Ret': [lag_2_ret],
-            'SMA_10_Pct': [(sma_10 / current_close) - 1],
-            'SMA_20_Pct': [(sma_20 / current_close) - 1],
-            'MACD_Pct': [macd / current_close if current_close != 0 else 0],
-            'RSI': [rsi],
-            'Vol_20': [vol_20],
-            'DayOfYear': [date_val.dayofyear],
-            'Month': [date_val.month]
+        # AI Inference
+        X = pd.DataFrame({
+            'Lag_1_Ret': [c_price / records[-2]['Close'] - 1],
+            'Lag_2_Ret': [c_price / records[-3]['Close'] - 1],
+            'SMA_10_Pct': [(np.mean([r['Close'] for r in records[-10:]])/c_price)-1],
+            'SMA_20_Pct': [(np.mean([r['Close'] for r in records[-20:]])/c_price)-1],
+            'MACD_Pct': [macd / c_price],
+            'RSI': [rsi], 'Vol_20': [vol_20],
+            'DayOfYear': [date_val.dayofyear], 'Month': [date_val.month]
         })
         
-        ai_residual = trained_model.predict(X_pred)[0]
-        baseline_noise = np.random.normal(0, sigma) 
+        ai_alpha = trained_model.predict(X)[0]
         
-        blended_return = daily_drift + ai_residual + baseline_noise
-        new_close = current_close * np.exp(blended_return)
+        # Forecast with stochastic noise (texture)
+        texture_noise = np.random.normal(0, sigma)
+        f_return = daily_drift + ai_alpha + texture_noise
+        new_close = c_price * np.exp(f_return)
         
-        for sim_idx in range(num_sims):
-            noise = np.random.normal(0, sigma)
-            sim_return = daily_drift + ai_residual + noise
+        # Monte Carlo Paths
+        for s in range(num_sims):
+            s_ret = daily_drift + ai_alpha + np.random.normal(0, sigma)
+            new_s_p = current_mc_prices[f'Sim_{s}'] * np.exp(s_ret)
+            mc_paths[f'Sim_{s}'].append(max(0.01, new_s_p))
+            current_mc_prices[f'Sim_{s}'] = new_s_p
             
-            new_sim_price = current_mc_prices[f'Sim_{sim_idx}'] * np.exp(sim_return)
-            new_sim_price = max(0.01, new_sim_price) 
-            
-            mc_paths[f'Sim_{sim_idx}'].append(new_sim_price)
-            current_mc_prices[f'Sim_{sim_idx}'] = new_sim_price
-            
-        step_uncertainty_pct = sigma * 1.96 * np.sqrt(i + 1)
-        upper_bound = new_close * np.exp(step_uncertainty_pct)
-        lower_bound = max(0.01, new_close * np.exp(-step_uncertainty_pct)) 
+        u_bound = new_close * np.exp(sigma * 1.96 * np.sqrt(i+1))
+        l_bound = new_close * np.exp(-sigma * 1.96 * np.sqrt(i+1))
         
-        new_record = {
-            'Date': date_val, 
-            'Close': new_close, 
-            'RSI': rsi,
-            'EMA_12': last_ema_12,
-            'EMA_26': last_ema_26,
-            'Avg_Gain': last_avg_gain,
-            'Avg_Loss': last_avg_loss,
-            'Upper_Bound': upper_bound,
-            'Lower_Bound': lower_bound
-        }
-        
-        records.append(new_record)
-        predictions.append(new_record)
-        
-        if len(records) > 50:
-            records.pop(0)
+        rec = {'Date': date_val, 'Close': new_close, 'Upper_Bound': u_bound, 'Lower_Bound': l_bound}
+        records.append(rec)
+        preds.append(rec)
+        if len(records) > 60: records.pop(0)
             
-    df_preds = pd.DataFrame(predictions)[['Date', 'Close', 'Upper_Bound', 'Lower_Bound']]
-    return df_preds, mc_paths
+    return pd.DataFrame(preds), mc_paths
 
 # -----------------------------------------------------------------------------
-# FUTURE FORECAST GENERATION
+# EXECUTION & PLOTTING
 # -----------------------------------------------------------------------------
-with st.spinner(f"Running Institutional Forecast & {n_simulations} Simulations..."):
-    future_start_buffer = data[['Date', 'Close']].tail(30).copy()
-    last_actual_date = future_start_buffer['Date'].iloc[-1]
-    
-    future_dates = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=forecast_days, freq='B')
-    future_forecast, mc_paths_data = generate_autoregressive_forecast(final_model, data, future_start_buffer, future_dates, n_simulations)
+with st.spinner("Generating Institutional AI Forecast..."):
+    future_dates = pd.date_range(start=data['Date'].iloc[-1] + pd.Timedelta(days=1), periods=forecast_days, freq='B')
+    f_forecast, mc_paths = generate_forecast(final_model, data, future_dates, n_simulations)
 
-plot_buffer = pd.concat([data[['Date', 'Close']], future_forecast[['Date', 'Close']]], ignore_index=True)
-plot_data = engineer_features(plot_buffer)
+plot_data = engineer_features(pd.concat([data, f_forecast], ignore_index=True))
 
-# -------------------------------------------------------------------------
-# FEATURE IMPORTANCE VISUALIZATION (SIDEBAR)
-# -------------------------------------------------------------------------
-importances = final_model.feature_importances_
-importance_df = pd.DataFrame({'Feature': features, 'Importance': importances})
-importance_df = importance_df.sort_values(by='Importance', ascending=True)
+fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.5, 0.15, 0.15, 0.2],
+                    subplot_titles=('Institutional Forecast', 'Bollinger Bands', 'RSI', 'MACD'))
 
-fig_imp = go.Figure(go.Bar(
-    x=importance_df['Importance'],
-    y=importance_df['Feature'],
-    orientation='h',
-    marker_color='teal',
-    opacity=0.8
-))
+# Main Chart
+fig.add_trace(go.Scatter(x=data[data['Date'] < split_date]['Date'], y=data[data['Date'] < split_date]['Close'], name='Train', line=dict(color='black')), row=1, col=1)
+fig.add_trace(go.Scatter(x=data[data['Date'] >= split_date]['Date'], y=data[data['Date'] >= split_date]['Close'], name='Test', line=dict(color='orange')), row=1, col=1)
+fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Close'], name='AI Forecast', line=dict(color='blue', width=2.5)), row=1, col=1)
 
-# Added Question Mark tooltip to the Feature Importance chart
-fig_imp.add_annotation(
-    x=1.0, y=1.1, xref="paper", yref="paper",
-    text="<b>?</b>", showarrow=False,
-    font=dict(color="white", size=11), bgcolor="rgba(100,100,100,0.6)", borderpad=4,
-    hovertext="Feature Importance: Ranks which technical indicators the AI uses most to predict returns. Longer bars = heavier influence."
-)
+for s in mc_paths:
+    fig.add_trace(go.Scatter(x=f_forecast['Date'], y=mc_paths[s], mode='lines', line=dict(color='rgba(0,150,255,0.05)'), showlegend=False), row=1, col=1)
 
-fig_imp.update_layout(
-    title="Model's Current Feature Weights",
-    title_font_size=14,
-    margin=dict(l=0, r=0, t=40, b=0),
-    height=250,
-    xaxis_title="Relative Importance Weight",
-    yaxis_title=None,
-    plot_bgcolor='white',
-    paper_bgcolor='white'
-)
-fig_imp.update_xaxes(showgrid=True, gridcolor='rgba(230,230,230,0.5)')
-st.sidebar.divider()
-st.sidebar.plotly_chart(fig_imp, use_container_width=True, config={'displayModeBar': True}) 
+# Confidence Interval
+fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Upper_Bound'], line=dict(width=0), showlegend=False), row=1, col=1)
+fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Lower_Bound'], fill='tonexty', fillcolor='rgba(0,100,255,0.1)', name='95% CI'), row=1, col=1)
 
-# -----------------------------------------------------------------------------
-# MASTER DASHBOARD VISUALIZATION
-# -----------------------------------------------------------------------------
-st.subheader("📈 AI Unified Technical & Forecast Dashboard")
+# Indicators
+fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], line=dict(color='gray', dash='dot'), name='Upper BB'), row=2, col=1)
+fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Lower_Band'], line=dict(color='gray', dash='dot'), fill='tonexty', name='Lower BB'), row=2, col=1)
+fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['RSI'], line=dict(color='purple'), name='RSI'), row=3, col=1)
+fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['MACD'], line=dict(color='blue'), name='MACD'), row=4, col=1)
 
-with st.container():
-    fig = make_subplots(
-        rows=4, cols=1, 
-        shared_xaxes=True, 
-        vertical_spacing=0.04, 
-        subplot_titles=(
-            f'{selected_stock} Institutional Forecast, Confidence & Monte Carlo', 
-            'Bollinger Bands', 
-            'RSI', 
-            'MACD'
-        ),
-        row_heights=[0.5, 0.15, 0.15, 0.2] 
-    )
+# Tooltips & Vertical Lines
+for r in range(1, 5):
+    fig.add_vline(x=split_date, line_dash="dash", line_color="orange", row=r, col=1)
+    fig.add_vline(x=data['Date'].iloc[-1], line_dash="dot", line_color="green", row=r, col=1)
+    fig.add_annotation(x=0.01, y=0.9, xref=f"x{r if r>1 else ''} domain", yref=f"y{r if r>1 else ''} domain", text="<b>?</b>", showarrow=False, 
+                       bgcolor="gray", font=dict(color="white"), hovertext="Zoom to inspect specific regions. Use the ModeBar (top right) to pan or reset.")
 
-    train_plot_data = data[data['Date'] < split_date]
-    test_plot_data = data[data['Date'] >= split_date]
-
-    fig.add_trace(go.Scatter(x=train_plot_data['Date'], y=train_plot_data['Close'], name='Train Data', mode='lines', line=dict(color='black', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=test_plot_data['Date'], y=test_plot_data['Close'], name='Test Data', mode='lines', line=dict(color='orange', width=1.5)), row=1, col=1)
-    
-    fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='AI Baseline Forecast', mode='lines', line=dict(color='blue', width=2.5)), row=1, col=1)
-
-    for sim_key, path_prices in mc_paths_data.items():
-        fig.add_trace(go.Scatter(
-            x=future_forecast['Date'],
-            y=path_prices,
-            mode='lines',
-            line=dict(color='rgba(0, 150, 255, 0.08)', width=1), 
-            showlegend=False,
-            hoverinfo='skip' 
-        ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=future_forecast['Date'], 
-        y=future_forecast['Upper_Bound'], 
-        name='95% Confidence Upper', 
-        line=dict(color='rgba(0,100,255,0.0)'),
-        showlegend=False
-    ), row=1, col=1)
-    
-    fig.add_trace(go.Scatter(
-        x=future_forecast['Date'], 
-        y=future_forecast['Lower_Bound'], 
-        name='95% Confidence Interval', 
-        line=dict(color='rgba(0,100,255,0.0)'),
-        fill='tonexty', 
-        fillcolor='rgba(0,100,255,0.1)', 
-        showlegend=True
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
-    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
-    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
-
-    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['RSI'], name='RSI', line=dict(color='purple', width=1.5)), row=3, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,0,0,0.5)", row=3, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,128,0,0.5)", row=3, col=1)
-
-    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['MACD'], name='MACD', line=dict(color='blue', width=1.5)), row=4, col=1)
-    fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], name='Signal', line=dict(color='red', width=1.5)), row=4, col=1)
-
-    macd_hist = plot_data['MACD'] - plot_data['Signal_Line']
-    macd_colors = ['rgba(0,128,0,0.6)' if val >= 0 else 'rgba(255,0,0,0.6)' for val in macd_hist]
-    fig.add_trace(go.Bar(x=plot_data['Date'], y=macd_hist, name='Hist', marker_color=macd_colors), row=4, col=1)
-
-    for r in range(1, 5):
-        fig.add_vline(x=split_date, line_dash="dash", line_color="orange", opacity=0.6, row=r, col=1)
-        fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", opacity=0.6, row=r, col=1)
-        
-    fig.add_annotation(x=split_date, y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="orange", size=10), xanchor="right", row=1, col=1)
-    fig.add_annotation(x=last_actual_date, y=1.05, yref="paper", text="Today", showarrow=False, font=dict(color="green", size=10), xanchor="left", row=1, col=1)
-
-    # -------------------------------------------------------------------------
-    # Add floating Question Mark tooltips to each subplot in the master layout
-    # -------------------------------------------------------------------------
-    hover_texts = [
-        "Forecast Plot: Black/Orange = Historical Train/Test. Blue = AI Expected Path. Shaded region = 95% Monte Carlo Confidence Interval.",
-        "Bollinger Bands: Measures volatility. Price pushing the Upper Band indicates overbought; pushing Lower Band indicates oversold.",
-        "RSI (Relative Strength Index): Momentum oscillator. Values >70 are typically overbought, <30 are oversold.",
-        "MACD: Trend momentum. Green bars = bullish momentum, Red = bearish. Line crossovers signal potential reversals."
-    ]
-    
-    for idx, text in enumerate(hover_texts, start=1):
-        xref = "x domain" if idx == 1 else f"x{idx} domain"
-        yref = "y domain" if idx == 1 else f"y{idx} domain"
-        
-        fig.add_annotation(
-            x=0.01, y=0.95, xref=xref, yref=yref,
-            text="<b>?</b>", showarrow=False,
-            font=dict(color="white", size=11), bgcolor="rgba(100,100,100,0.5)", borderpad=4,
-            hovertext=text
-        )
-
-    fig.update_layout(
-        height=900, 
-        showlegend=True,
-        legend=dict(
-            orientation="h", 
-            yanchor="bottom",
-            y=1.02, 
-            xanchor="right",
-            x=1,
-            font=dict(size=10)
-        ),
-        hovermode="x unified", 
-        margin=dict(l=10, r=10, t=50, b=10), 
-        plot_bgcolor='white', 
-        paper_bgcolor='white'
-    )
-    
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)', zeroline=False)
-
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'scrollZoom': True})
+fig.update_layout(height=1000, template='white', hovermode='x unified', legend=dict(orientation="h", y=1.05))
+st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'scrollZoom': True})
