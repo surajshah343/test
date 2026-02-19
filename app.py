@@ -13,7 +13,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolu
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
 # -----------------------------------------------------------------------------
-START = "2015-01-01" 
+START = "1999-01-01" 
 TODAY = date.today().strftime("%Y-%m-%d")
 
 os.makedirs("saved_models", exist_ok=True)
