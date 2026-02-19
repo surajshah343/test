@@ -96,7 +96,7 @@ data = calculate_technicals(data)
 df_prophet = data[['Date','Close']].rename(columns={"Date": "ds", "Close": "y"})
 
 # Define the split: Hold out the last 6 YEARS of data as the "Test" set
-test_days = 4 * 365
+test_days = 1 * 365
 train_data = df_prophet.iloc[:-test_days]
 test_data = df_prophet.iloc[-test_days:]
 
