@@ -147,9 +147,23 @@ fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Prophet Pre
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(width=0), showlegend=False), row=1, col=1)
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'), row=1, col=1)
 
-# Plotly Timestamp string fix
-split_date = train_data['ds'].iloc[-1].strftime('%Y-%m-%d')
-fig.add_vline(x=split_date, line_dash="dash", line_color="gray", annotation_text="Train/Test Split", row=1, col=1)
+# --- THE BUG FIX: Separate the line and the annotation ---
+split_date = train_data['ds'].iloc[-1]
+
+# 1. Add just the line (no text)
+fig.add_vline(x=split_date, line_dash="dash", line_color="gray", row=1, col=1)
+
+# 2. Add the text manually using a direct annotation
+fig.add_annotation(
+    x=split_date, 
+    y=1.05,            # Positions text slightly above the top of the chart
+    yref="paper",      # Uses relative positioning so it doesn't get messed up by stock prices
+    text="Train/Test Split",
+    showarrow=False,
+    font=dict(color="gray"),
+    xanchor="left",    # Aligns the text to start right after the line
+    row=1, col=1
+)
 
 # --- ROW 2: BOLLINGER BANDS ---
 fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name='Price', line=dict(color='black', width=1)), row=2, col=1)
