@@ -10,11 +10,12 @@ import xgboost as xgb
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
 # -----------------------------------------------------------------------------
-START = "2010-01-01" # Trimmed data for ML performance
+START = "2015-01-01" # Keep timeframe reasonable for ML relevance
 TODAY = date.today().strftime("%Y-%m-%d")
 
-st.set_page_config(page_title="XGBoost Stock Forecast", layout="wide")
-st.title('🌳 XGBoost Technical Forecast Dashboard')
+st.set_page_config(page_title="XGBoost Dynamic Forecast", layout="wide")
+st.title('🌳 XGBoost Dynamic Technical Forecast')
+st.markdown("This model dynamically recalculates RSI, MACD, and SMAs at every future step to prevent flatlining.")
 
 st.sidebar.header("Configuration")
 ticker_input = st.sidebar.text_input("Enter Ticker Symbol:", value="NVDA")
@@ -24,102 +25,150 @@ n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 forecast_days = n_years * 252 
 
 # -----------------------------------------------------------------------------
-# DATA LOADING & FEATURE ENGINEERING
+# DATA LOADING
 # -----------------------------------------------------------------------------
-@st.cache_data
+@st.cache_data(ttl=3600)
 def load_data(ticker):
-    data = yf.download(ticker, START, TODAY)
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    data.reset_index(inplace=True)
-    return data
+    try:
+        clean_ticker = str(ticker).split('-')[0].split(' ')[0].strip().upper()
+        data = yf.download(clean_ticker, START, TODAY)
+        
+        if data is None or data.empty:
+            return None
+            
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = [col[0] for col in data.columns]
+            
+        data.reset_index(inplace=True)
+        if 'Date' not in data.columns and 'index' in data.columns:
+            data.rename(columns={'index': 'Date'}, inplace=True)
+            
+        data.dropna(subset=['Close'], inplace=True)
+        return data[['Date', 'Close', 'Volume']].copy()
+    except Exception:
+        return None
 
 data = load_data(selected_stock)
 
 if data is None or data.empty:
-    st.error("Error loading data.")
+    st.error(f"Error: Could not pull data for '{selected_stock}'.")
     st.stop()
 
-def calculate_technicals(df):
+# -----------------------------------------------------------------------------
+# FEATURE ENGINEERING FUNCTION
+# -----------------------------------------------------------------------------
+def engineer_features(df):
+    """Calculates technicals and time features. Designed to run on historical AND rolling future data."""
     df = df.copy()
+    
+    # Time Features to prevent the model from getting lost
+    df['DayOfYear'] = df['Date'].dt.dayofyear
+    df['Month'] = df['Date'].dt.month
+    
+    # Technicals
+    df['SMA_10'] = df['Close'].rolling(window=10).mean()
+    df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = df['EMA_12'] - df['EMA_26']
-    df['SMA_20'] = df['Close'].rolling(window=20).mean()
     
+    # RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # Target Variable: Daily price difference
-    df['Price_Diff'] = df['Close'].diff()
+    # Lags and Target
+    df['Lag_1_Close'] = df['Close'].shift(1)
+    df['Lag_2_Close'] = df['Close'].shift(2)
     
-    # Lagged features (yesterday's data predicting today's diff)
-    df['Lag_Close'] = df['Close'].shift(1)
-    df['Lag_RSI'] = df['RSI'].shift(1)
-    df['Lag_MACD'] = df['MACD'].shift(1)
-    df['Target_Diff'] = df['Price_Diff'].shift(-1) # What we are trying to predict
+    # We predict the daily percentage return rather than raw dollar difference
+    # This scales better for rapidly growing stocks like NVDA
+    df['Daily_Return'] = df['Close'].pct_change()
+    df['Target_Return'] = df['Daily_Return'].shift(-1)
     
-    return df.dropna()
+    return df
 
-ml_data = calculate_technicals(data)
+# Apply to historical
+ml_data = engineer_features(data).dropna()
 
 # -----------------------------------------------------------------------------
 # XGBOOST MODEL TRAINING
 # -----------------------------------------------------------------------------
-features = ['Lag_Close', 'Lag_RSI', 'Lag_MACD']
-target = 'Target_Diff'
+features = ['Lag_1_Close', 'Lag_2_Close', 'SMA_10', 'SMA_20', 'MACD', 'RSI', 'DayOfYear', 'Month']
+target = 'Target_Return'
 
-# Split Data (Leave out last year for testing)
-test_size = 252
-train = ml_data.iloc[:-test_size]
-test = ml_data.iloc[-test_size:]
+X = ml_data[features]
+y = ml_data[target]
 
-X_train = train[features]
-y_train = train[target]
-
+# We use the entire dataset to train so it has the most recent context
 model = xgb.XGBRegressor(
-    n_estimators=100, 
+    n_estimators=150, 
     learning_rate=0.05, 
-    max_depth=4, 
+    max_depth=5, 
+    subsample=0.8,
     random_state=42
 )
 
-with st.spinner("Training XGBoost Model..."):
-    model.fit(X_train, y_train)
+with st.spinner("Training Dynamic XGBoost Model..."):
+    model.fit(X, y)
 
 # -----------------------------------------------------------------------------
-# ITERATIVE FORECASTING
+# DYNAMIC ITERATIVE FORECASTING
 # -----------------------------------------------------------------------------
-st.subheader("Predicting Future Prices")
+st.subheader("Predicting Future Trajectory")
 
-# We start from the very last known row of our data
-current_data = ml_data.iloc[-1:].copy()
-future_dates = pd.date_range(start=current_data['Date'].iloc[0] + pd.Timedelta(days=1), periods=forecast_days, freq='B')
+# Create a rolling buffer of the last 50 days to calculate technicals for the future
+rolling_buffer = data[['Date', 'Close']].tail(50).copy()
+future_dates = pd.date_range(start=rolling_buffer['Date'].iloc[-1] + pd.Timedelta(days=1), periods=forecast_days, freq='B')
 
 future_predictions = []
-current_close = current_data['Close'].iloc[0]
-current_rsi = current_data['RSI'].iloc[0]
-current_macd = current_data['MACD'].iloc[0]
 
-# Generate future steps one day at a time
-for date in future_dates:
-    # Build feature row for prediction
-    X_pred = pd.DataFrame({'Lag_Close': [current_close], 'Lag_RSI': [current_rsi], 'Lag_MACD': [current_macd]})
+progress_bar = st.progress(0)
+status_text = st.empty()
+
+for i, date_val in enumerate(future_dates):
+    # 1. Recalculate all features on the current rolling buffer
+    current_features_df = engineer_features(rolling_buffer)
     
-    # Predict the daily difference
-    predicted_diff = model.predict(X_pred)[0]
+    # 2. Extract the very last row of features to make today's prediction
+    last_row = current_features_df.iloc[-1]
     
-    # Calculate new close
-    new_close = current_close + predicted_diff
-    future_predictions.append({'Date': date, 'Predicted_Close': new_close})
+    X_pred = pd.DataFrame({
+        'Lag_1_Close': [last_row['Lag_1_Close']],
+        'Lag_2_Close': [last_row['Lag_2_Close']],
+        'SMA_10': [last_row['SMA_10']],
+        'SMA_20': [last_row['SMA_20']],
+        'MACD': [last_row['MACD']],
+        'RSI': [last_row['RSI']],
+        'DayOfYear': [date_val.dayofyear],
+        'Month': [date_val.month]
+    })
     
-    # Update variables for next loop iteration
-    # (In a true robust model, you'd recalculate MACD/RSI accurately over a rolling window, 
-    # but we hold them slightly static/decayed here for performance in Streamlit)
-    current_close = new_close
+    # 3. Predict the percentage return for the next day
+    predicted_return = model.predict(X_pred)[0]
+    
+    # 4. Calculate the new closing price based on the predicted return
+    current_close = last_row['Close']
+    new_close = current_close * (1 + predicted_return)
+    
+    future_predictions.append({'Date': date_val, 'Predicted_Close': new_close})
+    
+    # 5. Append the new prediction to the rolling buffer for the next loop iteration
+    new_row = pd.DataFrame({'Date': [date_val], 'Close': [new_close]})
+    rolling_buffer = pd.concat([rolling_buffer, new_row], ignore_index=True)
+    
+    # Keep buffer manageable
+    rolling_buffer = rolling_buffer.tail(50)
+    
+    # Update progress
+    if i % 20 == 0:
+        progress_bar.progress((i + 1) / forecast_days)
+        status_text.text(f"Simulating day {i+1} of {forecast_days}...")
+
+progress_bar.empty()
+status_text.empty()
 
 future_df = pd.DataFrame(future_predictions)
 
@@ -129,10 +178,31 @@ future_df = pd.DataFrame(future_predictions)
 fig = go.Figure()
 
 # Plot historical
-fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], mode='lines', name='Historical Close', line=dict(color='black')))
+fig.add_trace(go.Scatter(
+    x=data['Date'], y=data['Close'], 
+    mode='lines', name='Historical Close', line=dict(color='black', width=1.5)
+))
 
 # Plot XGBoost future
-fig.add_trace(go.Scatter(x=future_df['Date'], y=future_df['Predicted_Close'], mode='lines', name='XGBoost Forecast', line=dict(color='orange', width=2)))
+fig.add_trace(go.Scatter(
+    x=future_df['Date'], y=future_df['Predicted_Close'], 
+    mode='lines', name='Dynamic XGBoost Forecast', line=dict(color='orange', width=2)
+))
 
-fig.update_layout(title="XGBoost Iterative Forecast (Predicting Daily Returns)", height=600)
+# Add a visual separator
+split_date = future_df['Date'].iloc[0]
+fig.add_vline(x=split_date, line_dash="dash", line_color="gray")
+fig.add_annotation(
+    x=split_date, y=1.05, yref="paper", text="Today",
+    showarrow=False, font=dict(color="gray"), xanchor="left"
+)
+
+fig.update_layout(
+    title=f"XGBoost Dynamic Forecast for {selected_stock}", 
+    height=600,
+    xaxis_title="Date",
+    yaxis_title="Stock Price ($)",
+    hovermode="x unified"
+)
+
 st.plotly_chart(fig, use_container_width=True)
