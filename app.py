@@ -17,7 +17,7 @@ st.set_page_config(page_title="Pro Stock Forecast App", layout="wide")
 st.title('📈 Stock Dashboard by S. Shah')
 
 # -----------------------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR (NOW WITH HYPERPARAMETER TUNING)
 # -----------------------------------------------------------------------------
 st.sidebar.header("Configuration")
 ticker_input = st.sidebar.text_input("Enter Ticker Symbol:", value="NVDA")
@@ -25,6 +25,22 @@ selected_stock = ticker_input.upper()
 
 n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4)
 period = n_years * 365
+
+st.sidebar.divider()
+
+st.sidebar.subheader("Prophet Model Tuning")
+st.sidebar.markdown("""
+Tweak these to lower the MAE/MAPE error scores.
+""")
+# Changepoint Prior Scale: default is 0.05
+cps = st.sidebar.slider("Changepoint Prior Scale (Flexibility)", 
+                        min_value=0.001, max_value=0.500, value=0.050, step=0.001,
+                        help="Higher = more flexible trend (risks overfitting). Lower = stiffer trend (risks underfitting).")
+
+# Seasonality Prior Scale: default is 10.0
+sps = st.sidebar.slider("Seasonality Prior Scale", 
+                        min_value=0.01, max_value=15.00, value=10.00, step=0.01,
+                        help="Higher = model fits larger seasonal fluctuations. Lower = dampens seasonal effects.")
 
 # -----------------------------------------------------------------------------
 # DATA LOADING
@@ -74,7 +90,7 @@ def calculate_technicals(df):
 data = calculate_technicals(data)
 
 # -----------------------------------------------------------------------------
-# FORECASTING LOGIC (WITH TRAIN/TEST SPLIT)
+# FORECASTING LOGIC (WITH TRAIN/TEST SPLIT & TUNING)
 # -----------------------------------------------------------------------------
 df_prophet = data[['Date','Close']].rename(columns={"Date": "ds", "Close": "y"})
 
@@ -83,14 +99,35 @@ test_days = 365
 train_data = df_prophet.iloc[:-test_days]
 test_data = df_prophet.iloc[-test_days:]
 
-# Train the model ONLY on the older training data
-m = Prophet()
+# Train the model ONLY on the older training data, applying the sidebar hyperparameters
+m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps)
 m.fit(train_data)
 
 # Create future dates (Covering the 1-year test period + the user's future forecast)
 total_periods = test_days + period
 future = m.make_future_dataframe(periods=total_periods)
 forecast = m.predict(future)
+
+# -----------------------------------------------------------------------------
+# CALCULATE ACCURACY METRICS ON TEST DATA
+# -----------------------------------------------------------------------------
+# Align the test actuals with the model's predictions for those specific dates
+eval_df = test_data.merge(forecast[['ds', 'yhat']], on='ds', how='inner')
+
+# Calculate Errors
+mae = np.mean(np.abs(eval_df['y'] - eval_df['yhat']))
+mape = np.mean(np.abs((eval_df['y'] - eval_df['yhat']) / eval_df['y'])) * 100
+
+# Display Metrics in the UI
+st.subheader("Model Accuracy (Against Last 365 Days Held-Out Data)")
+col1, col2, col3 = st.columns(3)
+current_price = data['Close'].iloc[-1]
+
+col1.metric("Current Known Price", f"${current_price:.2f}")
+col2.metric("Mean Absolute Error (MAE)", f"${mae:.2f}", help="Average dollar amount the prediction was off during the test period.")
+col3.metric("MAPE (Percentage Error)", f"{mape:.2f}%", help="Average percentage the prediction was off during the test period.")
+
+st.divider()
 
 # -----------------------------------------------------------------------------
 # MASTER DASHBOARD (ALL IN ONE)
@@ -104,24 +141,13 @@ fig = make_subplots(
 )
 
 # --- ROW 1: PROPHET FORECAST ---
-# 1. Train Actuals (Black Dots)
 fig.add_trace(go.Scatter(x=train_data['ds'], y=train_data['y'], name='Train Data', mode='markers', marker=dict(color='black', size=4)), row=1, col=1)
-
-# 2. Test Actuals (Orange Dots - Held out data to evaluate model accuracy)
 fig.add_trace(go.Scatter(x=test_data['ds'], y=test_data['y'], name='Test Data (Actual)', mode='markers', marker=dict(color='orange', size=5)), row=1, col=1)
-
-# 3. Predicted Trend (Blue Line)
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Prophet Prediction', mode='lines', line=dict(color='blue')), row=1, col=1)
+fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(width=0), showlegend=False), row=1, col=1)
+fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'), row=1, col=1)
 
-# 4. Confidence Interval (Upper & Lower)
-fig.add_trace(go.Scatter(
-    x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(width=0), showlegend=False
-), row=1, col=1)
-fig.add_trace(go.Scatter(
-    x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'
-), row=1, col=1)
-
-# THE FIX IS HERE: Convert the Pandas Timestamp to a string using strftime
+# Plotly Timestamp string fix
 split_date = train_data['ds'].iloc[-1].strftime('%Y-%m-%d')
 fig.add_vline(x=split_date, line_dash="dash", line_color="gray", annotation_text="Train/Test Split", row=1, col=1)
 
@@ -147,10 +173,8 @@ fig.update_layout(
     showlegend=True,
     title_text="Unified Technical & Forecast Dashboard"
 )
-
 fig.update_xaxes(rangeslider_visible=False)
 
-# Display the Master Chart
 st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------------------------------------------------------
