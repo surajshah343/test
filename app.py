@@ -24,7 +24,7 @@ st.set_page_config(page_title="AI Pro Dashboard", layout="wide")
 # Title with "How to read" popover
 t1, t2 = st.columns([0.9, 0.1])
 with t1:
-    st.title('🧠 Continuous Learning AI Dashboard by S. Shah')
+    st.title('🧠 CL- AI Dashboard by S. Shah')
 with t2:
     with st.popover("?"):
         st.markdown("**Dashboard Guide:** This tool uses XGBoost to predict the 'Alpha' (residual) of a stock over its rolling drift, combined with Monte Carlo simulations for risk assessment.")
@@ -195,9 +195,6 @@ with st.spinner("Generating Forecast..."):
     future_dates = pd.date_range(start=data['Date'].iloc[-1] + pd.Timedelta(days=1), periods=forecast_days, freq='B')
     f_forecast, mc_paths = generate_forecast(final_model, data, future_dates, n_simulations)
 
-# -----------------------------------------------------------------------------
-# PLOTTING
-# -----------------------------------------------------------------------------
 plot_data = engineer_features(pd.concat([data, f_forecast], ignore_index=True))
 
 fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.4, 0.2, 0.2, 0.2],
@@ -205,14 +202,14 @@ fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04, ro
 
 # Subplot 1: Forecast
 fig.add_trace(go.Scatter(x=data[data['Date'] < split_date]['Date'], y=data[data['Date'] < split_date]['Close'], name='Train', line=dict(color='black')), row=1, col=1)
-fig.add_trace(go.Scatter(x=data[data['Date'] >= split_date]['Date'], y=data[data['Date'] >= split_date]['Close'], name='Test', line=dict(color='limegreen')), row=1, col=1) # Different color for Test
+fig.add_trace(go.Scatter(x=data[data['Date'] >= split_date]['Date'], y=data[data['Date'] >= split_date]['Close'], name='Test', line=dict(color='limegreen')), row=1, col=1)
 fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Close'], name='AI Forecast', line=dict(color='blue', width=2.5)), row=1, col=1)
 
 for s in mc_paths:
     fig.add_trace(go.Scatter(x=f_forecast['Date'], y=mc_paths[s], mode='lines', line=dict(color='rgba(0,150,255,0.05)'), showlegend=False), row=1, col=1)
 
 fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Upper_Bound'], line=dict(width=0), showlegend=False), row=1, col=1)
-fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Lower_Bound'], fill='tonexty', fillcolor='rgba(255, 165, 0, 0.2)', name='95% Forecast CI'), row=1, col=1) # Different color for CI
+fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Lower_Bound'], fill='tonexty', fillcolor='rgba(255, 165, 0, 0.2)', name='95% Forecast CI'), row=1, col=1)
 
 # Subplot 2: Bollinger Bands + Price Line
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Price', line=dict(color='black', width=1)), row=2, col=1)
@@ -230,17 +227,21 @@ fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], line=d
 colors = ['green' if val >= 0 else 'red' for val in plot_data['MACD_Hist']]
 fig.add_trace(go.Bar(x=plot_data['Date'], y=plot_data['MACD_Hist'], marker_color=colors, name='MACD Histogram'), row=4, col=1)
 
-# Tooltips (Annotations)
+# Tooltips
 tooltips = [
     (1, "<b>Main Forecast:</b> Black is historical, Green is test data, Blue is AI forecast. Shaded area is 95% confidence."),
     (2, "<b>Bollinger Bands:</b> Measures volatility. Price staying near bands suggests overbought/oversold conditions."),
     (3, "<b>RSI:</b> Relative Strength Index. >70 is overbought, <30 is oversold."),
     (4, "<b>MACD:</b> Trend indicator. Histogram shows the distance between MACD and Signal lines.")
 ]
-
 for row, txt in tooltips:
     fig.add_annotation(x=0.01, y=0.95, xref=f"x{row if row > 1 else ''} domain", yref=f"y{row if row > 1 else ''} domain",
                        text="<b>?</b>", showarrow=False, bgcolor="black", font=dict(color="white"), hovertext=txt)
+
+# FIX: AUTO-CAP Y-AXIS
+# We set the max height to 3x the current price to keep outliers from squashing the chart
+max_price = data['Close'].iloc[-1]
+fig.update_yaxes(range=[0, max_price * 3], row=1, col=1)
 
 fig.update_layout(height=1100, template='plotly_white', hovermode='x unified', legend=dict(orientation="h", y=1.02))
 st.plotly_chart(fig, use_container_width=True)
