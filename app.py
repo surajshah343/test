@@ -12,7 +12,7 @@ import itertools
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
 # -----------------------------------------------------------------------------
-START = "2000-01-01"
+START = "1970-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 
 # Dynamic Cap Multiplier (2.0 = Cap is 200% of historical All-Time High)
