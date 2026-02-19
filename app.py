@@ -45,19 +45,20 @@ META_FILE = f"saved_models/{selected_stock}_meta.json"
 # DATA LOADING
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def load_data(ticker):
+def load_data(ticker, start_date): # Add start_date here
     try:
-        clean_ticker = str(ticker).split('-')[0].split(' ')[0].strip().upper()
-        data = yf.download(clean_ticker, START, TODAY)
+        data = yf.download(ticker, start_date, TODAY)
         if data is None or data.empty: return None
         if isinstance(data.columns, pd.MultiIndex): data.columns = [col[0] for col in data.columns]
         data.reset_index(inplace=True)
         if 'Date' not in data.columns and 'index' in data.columns: data.rename(columns={'index': 'Date'}, inplace=True)
         data.dropna(subset=['Close'], inplace=True)
-        return data[['Date', 'Close']].copy()
-    except Exception: return None
+       return data
+    except Exception:
+        return None
 
-data = load_data(selected_stock)
+# When calling it:
+data = load_data(selected_stock, START)
 
 if data is None or data.empty:
     st.error(f"Error: Could not pull data for '{selected_stock}'. Check ticker symbol.")
