@@ -121,7 +121,29 @@ if not os.path.exists(MODEL_FILE):
     with open(META_FILE, 'w') as f: json.dump({"last_trained_date": full_ml_data['Date'].max().strftime("%Y-%m-%d")}, f)
 else:
     final_model.load_model(MODEL_FILE)
+# -----------------------------------------------------------------------------
+# ACCURACY METRICS (BACKTESTING)
+# -----------------------------------------------------------------------------
+st.subheader("📊 Model Performance Metrics")
 
+# 1. Prepare Test Data (The last 20% of history)
+test_size = int(len(full_ml_data) * 0.2)
+test_data = full_ml_data.tail(test_size)
+
+# 2. Generate Predictions for the Test Set
+test_preds_residual = final_model.predict(test_data[features])
+
+# 3. Calculate Error Metrics
+mae = mean_absolute_error(test_data[target], test_preds_residual)
+rmse = np.sqrt(mean_squared_error(test_data[target], test_preds_residual))
+mape = mean_absolute_percentage_error(test_data[target], test_preds_residual)
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Mean Absolute Error (MAE)", f"{mae:.4f}", help="Average error in the predicted daily residual.")
+col2.metric("RMSE", f"{rmse:.4f}", help="Penalizes larger errors more heavily.")
+col3.metric("MAPE", f"{mape*100:.2f}%", help="Average percentage error.")
+
+st.info(f"Note: These metrics evaluate the 'Residual' (Alpha) prediction, not the final price directly.")
 # -----------------------------------------------------------------------------
 # CACHED FORECAST GENERATION (With Progress Bar)
 # -----------------------------------------------------------------------------
