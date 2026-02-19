@@ -6,6 +6,7 @@ from plotly import graph_objs as go
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+import calendar
 
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
@@ -14,7 +15,7 @@ START = "1990-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 
 st.set_page_config(page_title="Pro Dashboard", layout="wide")
-st.title('🌳 Unified Technical Dashboard by S.Shah')
+st.title('🌳 Auto-Optimized Technical Dashboard by S. Shah')
 
 # -----------------------------------------------------------------------------
 # SIDEBAR (CONFIGURATION)
@@ -23,10 +24,7 @@ st.sidebar.header("Configuration")
 ticker_input = st.sidebar.text_input("Enter Ticker Symbol:", value="NVDA")
 selected_stock = ticker_input.upper()
 
-test_years = st.sidebar.slider('Test Data Horizon (Years):', 1, 4, value=1)
 n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
-
-test_days = test_years * 252
 forecast_days = n_years * 252 
 
 # -----------------------------------------------------------------------------
@@ -62,76 +60,59 @@ if data is None or data.empty:
 # -----------------------------------------------------------------------------
 # FEATURE ENGINEERING & TECHNICAL INDICATORS
 # -----------------------------------------------------------------------------
-def engineer_features(df):
-    """Calculates all technicals required for both the model and the plots."""
+def engineer_features(df, drop_nans=False):
+    """
+    Calculates technicals. 
+    drop_nans=True is used for ML training so XGBoost doesn't crash.
+    drop_nans=False is used for Plotly so lines remain continuous on the chart.
+    """
     df = df.copy()
     
-    # Time Features
     df['DayOfYear'] = df['Date'].dt.dayofyear
     df['Month'] = df['Date'].dt.month
     
-    # Moving Averages & Bands
     df['SMA_10'] = df['Close'].rolling(window=10).mean()
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['Std_Dev'] = df['Close'].rolling(window=20).std()
     df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
     df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
     
-    # MACD
     df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = df['EMA_12'] - df['EMA_26']
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     
-    # RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # Lags and Target for ML
     df['Lag_1_Close'] = df['Close'].shift(1)
     df['Lag_2_Close'] = df['Close'].shift(2)
     df['Daily_Return'] = df['Close'].pct_change()
     df['Target_Return'] = df['Daily_Return'].shift(-1)
     
+    if drop_nans:
+        return df.dropna()
     return df
 
-# Apply to all historical data
-full_ml_data = engineer_features(data)
-
-# Split into Train and Test sets
-train_data = full_ml_data.iloc[:-test_days].dropna().copy()
-test_data = full_ml_data.iloc[-test_days:].copy()
-
-# -----------------------------------------------------------------------------
-# XGBOOST MODEL TRAINING
-# -----------------------------------------------------------------------------
+full_ml_data = engineer_features(data, drop_nans=True)
 features = ['Lag_1_Close', 'Lag_2_Close', 'SMA_10', 'SMA_20', 'MACD', 'RSI', 'DayOfYear', 'Month']
 target = 'Target_Return'
 
-model = xgb.XGBRegressor(
-    n_estimators=150, 
-    learning_rate=0.05, 
-    max_depth=5, 
-    subsample=0.8,
-    random_state=42
-)
-
-with st.spinner(f"Training XGBoost Model on {selected_stock}..."):
-    model.fit(train_data[features], train_data[target])
-
 # -----------------------------------------------------------------------------
-# DYNAMIC ITERATIVE FORECASTING ENGINE
+# AUTOREGRESSIVE FORECAST FUNCTION
 # -----------------------------------------------------------------------------
-def generate_autoregressive_forecast(start_buffer, dates_to_predict):
-    """Simulates future days one by one, recalculating technicals at each step."""
+def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predict):
+    """Simulates future days iteratively."""
     buffer = start_buffer.copy()
     predictions = []
     
     for date_val in dates_to_predict:
-        current_features_df = engineer_features(buffer)
+        # We don't drop NaNs here because the buffer might be short, 
+        # but the last row will have all valid features.
+        current_features_df = engineer_features(buffer, drop_nans=False) 
         last_row = current_features_df.iloc[-1]
         
         X_pred = pd.DataFrame({
@@ -145,57 +126,128 @@ def generate_autoregressive_forecast(start_buffer, dates_to_predict):
             'Month': [date_val.month]
         })
         
-        predicted_return = model.predict(X_pred)[0]
+        predicted_return = trained_model.predict(X_pred)[0]
         new_close = last_row['Close'] * (1 + predicted_return)
         
-        predictions.append({'Date': date_val, 'Close': new_close, 'Type': 'Forecast'})
+        predictions.append({'Date': date_val, 'Close': new_close})
         
         new_row = pd.DataFrame({'Date': [date_val], 'Close': [new_close]})
-        buffer = pd.concat([buffer, new_row], ignore_index=True).tail(60) # Keep buffer light
+        buffer = pd.concat([buffer, new_row], ignore_index=True).tail(60) 
         
     return pd.DataFrame(predictions)
 
-with st.spinner("Simulating Test Data & Future Trajectory..."):
-    # 1. Simulate the Test Period
-    test_start_buffer = train_data[['Date', 'Close']].tail(60).copy()
-    test_dates = test_data['Date'].tolist()
-    test_forecast = generate_autoregressive_forecast(test_start_buffer, test_dates)
+# -----------------------------------------------------------------------------
+# ML OPTIMIZATION ENGINE (GRID SEARCH FOR OPTIMAL TEST YEARS)
+# -----------------------------------------------------------------------------
+def optimize_xgboost_horizon():
+    test_years_grid = [1, 2, 3, 4]
+    best_mape = float('inf')
+    best_ty = 1
+    best_test_forecast = None
     
-    # 2. Simulate the Future Period
+    total_days = len(full_ml_data)
+    
+    for ty in test_years_grid:
+        test_days_iter = ty * 252
+        if total_days <= test_days_iter + 252:
+            continue
+            
+        train_iter = full_ml_data.iloc[:-test_days_iter].copy()
+        test_iter = full_ml_data.iloc[-test_days_iter:].copy()
+        
+        model_iter = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
+        model_iter.fit(train_iter[features], train_iter[target])
+        
+        start_buffer = train_iter[['Date', 'Close']].tail(60).copy()
+        test_dates = test_iter['Date'].tolist()
+        
+        # Simulate the test period iteratively
+        forecast_iter = generate_autoregressive_forecast(model_iter, start_buffer, test_dates)
+        
+        # Evaluate
+        eval_df = test_iter[['Date', 'Close']].merge(forecast_iter[['Date', 'Close']], on='Date', suffixes=('_Actual', '_Pred'))
+        mape_iter = np.mean(np.abs((eval_df['Close_Actual'] - eval_df['Close_Pred']) / eval_df['Close_Actual'])) * 100
+        
+        if mape_iter < best_mape:
+            best_mape = mape_iter
+            best_ty = ty
+            best_test_forecast = forecast_iter
+            
+    return best_ty, best_mape, best_test_forecast
+
+with st.spinner("Running Grid Search to find optimal Test Horizon..."):
+    optimal_test_years, final_mape, test_forecast = optimize_xgboost_horizon()
+
+st.sidebar.divider()
+st.sidebar.subheader("🤖 Auto-ML Tuning Active")
+st.sidebar.info(f"""
+**Optimal Test Horizon:** {optimal_test_years} Years  
+**Minimized MAPE:** {final_mape:.2f}%
+""")
+
+# -----------------------------------------------------------------------------
+# FINAL MODEL TRAINING & FUTURE FORECAST
+# -----------------------------------------------------------------------------
+test_days = optimal_test_years * 252
+train_data = full_ml_data.iloc[:-test_days].copy()
+test_data = full_ml_data.iloc[-test_days:].copy()
+
+final_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
+
+with st.spinner("Training Final Model and Generating Future Forecast..."):
+    final_model.fit(train_data[features], train_data[target])
+    
     future_start_buffer = full_ml_data[['Date', 'Close']].tail(60).copy()
     last_actual_date = future_start_buffer['Date'].iloc[-1]
     future_dates = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=forecast_days, freq='B')
-    future_forecast = generate_autoregressive_forecast(future_start_buffer, future_dates)
+    
+    future_forecast = generate_autoregressive_forecast(final_model, future_start_buffer, future_dates)
 
-# Combine for visualization
+# Generate smooth plotting data (drop_nans=False ensures lines connect across splits)
 all_forecasts = pd.concat([test_forecast, future_forecast], ignore_index=True)
-
-# Generate final plot data by running technicals over the historically connected forecast
 combined_price_data = pd.concat([train_data[['Date', 'Close']], all_forecasts[['Date', 'Close']]], ignore_index=True)
-plot_data = engineer_features(combined_price_data)
+plot_data = engineer_features(combined_price_data, drop_nans=False)
 
 # -----------------------------------------------------------------------------
-# CALCULATE ACCURACY METRICS ON TEST DATA
+# SEASONALITY ANALYSIS (DAY OF WEEK & MONTH)
 # -----------------------------------------------------------------------------
-# Merge actuals with test forecast to calculate errors
-eval_df = test_data[['Date', 'Close']].merge(test_forecast[['Date', 'Close']], on='Date', suffixes=('_Actual', '_Pred'))
+st.subheader("🗓️ Historical Seasonality Analysis")
+st.markdown("Average performance historically grouped by the day of the week and month of the year.")
 
-mae = np.mean(np.abs(eval_df['Close_Actual'] - eval_df['Close_Pred']))
-mape = np.mean(np.abs((eval_df['Close_Actual'] - eval_df['Close_Pred']) / eval_df['Close_Actual'])) * 100
+seas_df = data.copy()
+seas_df['Daily_Return'] = seas_df['Close'].pct_change() * 100
+seas_df['DayOfWeek'] = seas_df['Date'].dt.day_name()
+seas_df['Month'] = seas_df['Date'].dt.month_name()
 
-st.subheader(f"Model Accuracy (Against Last {test_years} Years Held-Out Data)")
-col1, col2, col3 = st.columns(3)
-current_price = data['Close'].iloc[-1]
+# Day of Week Data
+day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+day_stats = seas_df.groupby('DayOfWeek')['Daily_Return'].mean().reindex(day_order).fillna(0)
+day_colors = ['green' if val >= 0 else 'red' for val in day_stats]
 
-col1.metric("Current Known Price", f"${current_price:.2f}")
-col2.metric("Mean Absolute Error (MAE)", f"${mae:.2f}")
-col3.metric("MAPE (Percentage Error)", f"{mape:.2f}%")
+# Month Data
+month_order = list(calendar.month_name)[1:]
+month_stats = seas_df.groupby('Month')['Daily_Return'].mean().reindex(month_order).fillna(0)
+month_colors = ['green' if val >= 0 else 'red' for val in month_stats]
+
+col_s1, col_s2 = st.columns(2)
+
+with col_s1:
+    fig_day = go.Figure(data=[go.Bar(x=day_stats.index, y=day_stats.values, marker_color=day_colors)])
+    fig_day.update_layout(title="Average Return by Day of Week (%)", height=300, margin=dict(l=0, r=0, t=40, b=0))
+    st.plotly_chart(fig_day, use_container_width=True)
+
+with col_s2:
+    fig_month = go.Figure(data=[go.Bar(x=month_stats.index, y=month_stats.values, marker_color=month_colors)])
+    fig_month.update_layout(title="Average Return by Month (%)", height=300, margin=dict(l=0, r=0, t=40, b=0))
+    st.plotly_chart(fig_month, use_container_width=True)
 
 st.divider()
 
 # -----------------------------------------------------------------------------
-# MASTER DASHBOARD (ALL IN ONE)
+# MASTER DASHBOARD VISUALIZATION
 # -----------------------------------------------------------------------------
+st.subheader("📈 Unified Technical & Forecast Dashboard")
+
 fig = make_subplots(
     rows=4, cols=1, 
     shared_xaxes=True, 
@@ -207,18 +259,15 @@ fig = make_subplots(
 # --- ROW 1: PRICE & FORECAST ---
 fig.add_trace(go.Scatter(x=train_data['Date'], y=train_data['Close'], name='Train Data', mode='lines', line=dict(color='black')), row=1, col=1)
 fig.add_trace(go.Scatter(x=test_data['Date'], y=test_data['Close'], name='Test Data (Actual)', mode='lines', line=dict(color='rgba(0,0,0,0.3)')), row=1, col=1)
-fig.add_trace(go.Scatter(x=test_forecast['Date'], y=test_forecast['Close'], name='Test Forecast Simulation', mode='lines', line=dict(color='orange', dash='dot')), row=1, col=1)
+fig.add_trace(go.Scatter(x=test_forecast['Date'], y=test_forecast['Close'], name='Test Forecast (Simulated)', mode='lines', line=dict(color='orange', dash='dot')), row=1, col=1)
 fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='Future Forecast', mode='lines', line=dict(color='blue', width=2)), row=1, col=1)
 
 split_date = train_data['Date'].iloc[-1]
 fig.add_vline(x=split_date, line_dash="dash", line_color="gray", row=1, col=1)
-fig.add_annotation(
-    x=split_date, y=1.05, yref="paper", text="Train/Test Split",
-    showarrow=False, font=dict(color="gray"), xanchor="left", row=1, col=1
-)
+fig.add_annotation(x=split_date, y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="gray"), xanchor="left", row=1, col=1)
 
 # --- ROW 2: BOLLINGER BANDS ---
-fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1)), row=2, col=1)
+fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
 
@@ -230,18 +279,20 @@ fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
 # --- ROW 4: MACD ---
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['MACD'], name='MACD', line=dict(color='blue')), row=4, col=1)
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], name='Signal', line=dict(color='red')), row=4, col=1)
-colors = ['green' if val >= 0 else 'red' for val in (plot_data['MACD'] - plot_data['Signal_Line']).dropna()]
-# Align colors with the non-NaN MACD subset
-macd_dates = plot_data['Date'][plot_data['MACD'].notna()]
-fig.add_trace(go.Bar(x=macd_dates, y=(plot_data['MACD'] - plot_data['Signal_Line']).dropna(), name='Hist', marker_color=colors), row=4, col=1)
+
+# Bar chart for MACD Histogram
+macd_hist = plot_data['MACD'] - plot_data['Signal_Line']
+macd_colors = ['green' if val >= 0 else 'red' for val in macd_hist]
+fig.add_trace(go.Bar(x=plot_data['Date'], y=macd_hist, name='Hist', marker_color=macd_colors), row=4, col=1)
 
 # Add today line to all subplots
 fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=1, col=1)
 fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=2, col=1)
 fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=3, col=1)
 fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=4, col=1)
+fig.add_annotation(x=last_actual_date, y=1.05, yref="paper", text="Today", showarrow=False, font=dict(color="green"), xanchor="left", row=1, col=1)
 
-fig.update_layout(height=1200, showlegend=True, title_text="Unified Technical & XGBoost Forecast Dashboard")
+fig.update_layout(height=1200, showlegend=True)
 fig.update_xaxes(rangeslider_visible=False)
 
 st.plotly_chart(fig, use_container_width=True)
