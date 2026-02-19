@@ -24,7 +24,7 @@ st.set_page_config(page_title="AI Pro Dashboard", layout="wide")
 # Title with "How to read" popover
 t1, t2 = st.columns([0.9, 0.1])
 with t1:
-    st.title('🧠 CL- AI Dashboard by S. Shah')
+    st.title('🧠 Continuous Learning AI Dashboard by S. Shah')
 with t2:
     with st.popover("?"):
         st.markdown("**Dashboard Guide:** This tool uses XGBoost to predict the 'Alpha' (residual) of a stock over its rolling drift, combined with Monte Carlo simulations for risk assessment.")
@@ -36,6 +36,9 @@ selected_stock = ticker_input.upper()
 n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 forecast_days = n_years * 252 
 n_simulations = st.sidebar.slider('Monte Carlo Paths:', 0, 50, value=20)
+
+# Toggle for simulation paths to keep chart clean
+show_paths = st.sidebar.toggle("Show Individual Sim Paths", value=True, help="Toggle the faint blue lines (individual Monte Carlo paths).")
 
 MODEL_FILE = f"saved_models/{selected_stock}_continuous_model.json"
 META_FILE = f"saved_models/{selected_stock}_meta.json"
@@ -92,7 +95,7 @@ def engineer_features(df):
     rs = df['Avg_Gain'] / df['Avg_Loss'].replace(0, np.nan)
     df['RSI'] = np.where(df['Avg_Loss'] == 0, 100, 100 - (100 / (1 + rs)))
     
-    # Returns
+    # Returns & Targets
     df['Lag_1_Ret'] = df['Close'] / df['Close'].shift(1) - 1
     df['Lag_2_Ret'] = df['Close'] / df['Close'].shift(2) - 1
     df['SMA_10_Pct'] = df['SMA_10'] / df['Close'] - 1
@@ -121,17 +124,14 @@ quick_eval_model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_de
 quick_eval_model.fit(train_eval[features], train_eval[target])
 eval_preds = quick_eval_model.predict(test_eval[features])
 
-# Sidebar Metrics
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Accuracy Metrics")
 c1, c2 = st.sidebar.columns(2)
-c1.metric("MAE", f"{mean_absolute_error(test_eval[target], eval_preds):.4f}", help="Mean Absolute Error: Lower is better.")
+c1.metric("MAE", f"{mean_absolute_error(test_eval[target], eval_preds):.4f}", help="Mean Absolute Error of predicted residuals.")
 c2.metric("RMSE", f"{np.sqrt(mean_squared_error(test_eval[target], eval_preds)):.4f}", help="Root Mean Squared Error.")
 
-# Model Loading/Training
 final_model = xgb.XGBRegressor()
 if not os.path.exists(MODEL_FILE):
-    st.sidebar.warning("Training Model...")
     tuner = RandomizedSearchCV(xgb.XGBRegressor(random_state=42), {'max_depth': [3, 5], 'n_estimators': [100]}, n_iter=2, cv=2)
     tuner.fit(full_ml_data[features], full_ml_data[target])
     final_model = tuner.best_estimator_
@@ -141,7 +141,7 @@ else:
     final_model.load_model(MODEL_FILE)
 
 # -----------------------------------------------------------------------------
-# FORECAST GENERATION (Recursive)
+# FORECAST GENERATION
 # -----------------------------------------------------------------------------
 def generate_forecast(trained_model, historical_df, dates_to_predict, num_sims):
     hist_eng = engineer_features(historical_df)
@@ -195,6 +195,9 @@ with st.spinner("Generating Forecast..."):
     future_dates = pd.date_range(start=data['Date'].iloc[-1] + pd.Timedelta(days=1), periods=forecast_days, freq='B')
     f_forecast, mc_paths = generate_forecast(final_model, data, future_dates, n_simulations)
 
+# -----------------------------------------------------------------------------
+# PLOTTING
+# -----------------------------------------------------------------------------
 plot_data = engineer_features(pd.concat([data, f_forecast], ignore_index=True))
 
 fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.4, 0.2, 0.2, 0.2],
@@ -205,8 +208,9 @@ fig.add_trace(go.Scatter(x=data[data['Date'] < split_date]['Date'], y=data[data[
 fig.add_trace(go.Scatter(x=data[data['Date'] >= split_date]['Date'], y=data[data['Date'] >= split_date]['Close'], name='Test', line=dict(color='limegreen')), row=1, col=1)
 fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Close'], name='AI Forecast', line=dict(color='blue', width=2.5)), row=1, col=1)
 
-for s in mc_paths:
-    fig.add_trace(go.Scatter(x=f_forecast['Date'], y=mc_paths[s], mode='lines', line=dict(color='rgba(0,150,255,0.05)'), showlegend=False), row=1, col=1)
+if show_paths:
+    for s in mc_paths:
+        fig.add_trace(go.Scatter(x=f_forecast['Date'], y=mc_paths[s], mode='lines', line=dict(color='rgba(0,150,255,0.05)'), showlegend=False), row=1, col=1)
 
 fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Upper_Bound'], line=dict(width=0), showlegend=False), row=1, col=1)
 fig.add_trace(go.Scatter(x=f_forecast['Date'], y=f_forecast['Lower_Bound'], fill='tonexty', fillcolor='rgba(255, 165, 0, 0.2)', name='95% Forecast CI'), row=1, col=1)
@@ -229,19 +233,18 @@ fig.add_trace(go.Bar(x=plot_data['Date'], y=plot_data['MACD_Hist'], marker_color
 
 # Tooltips
 tooltips = [
-    (1, "<b>Main Forecast:</b> Black is historical, Green is test data, Blue is AI forecast. Shaded area is 95% confidence."),
-    (2, "<b>Bollinger Bands:</b> Measures volatility. Price staying near bands suggests overbought/oversold conditions."),
-    (3, "<b>RSI:</b> Relative Strength Index. >70 is overbought, <30 is oversold."),
-    (4, "<b>MACD:</b> Trend indicator. Histogram shows the distance between MACD and Signal lines.")
+    (1, "<b>Forecast:</b> Black (Train), Green (Test), Blue (AI Forecast). Orange area is 95% Confidence."),
+    (2, "<b>Bollinger Bands:</b> Price volatility indicator. Staying within bands is normal; breakouts suggest trends."),
+    (3, "<b>RSI:</b> Overbought > 70, Oversold < 30."),
+    (4, "<b>MACD:</b> Histogram shows momentum. Crossovers with the Signal line suggest trend changes.")
 ]
 for row, txt in tooltips:
     fig.add_annotation(x=0.01, y=0.95, xref=f"x{row if row > 1 else ''} domain", yref=f"y{row if row > 1 else ''} domain",
                        text="<b>?</b>", showarrow=False, bgcolor="black", font=dict(color="white"), hovertext=txt)
 
-# FIX: AUTO-CAP Y-AXIS
-# We set the max height to 3x the current price to keep outliers from squashing the chart
-max_price = data['Close'].iloc[-1]
-fig.update_yaxes(range=[0, max_price * 3], row=1, col=1)
+# AUTO-CAP Y-AXIS: Keeps outliers from squashing the chart
+current_p = data['Close'].iloc[-1]
+fig.update_yaxes(range=[0, current_p * 3.5], row=1, col=1)
 
 fig.update_layout(height=1100, template='plotly_white', hovermode='x unified', legend=dict(orientation="h", y=1.02))
 st.plotly_chart(fig, use_container_width=True)
