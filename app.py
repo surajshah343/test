@@ -256,7 +256,7 @@ st.plotly_chart(fig_comp, use_container_width=True)
 # -----------------------------------------------------------------------------
 # RAW DATA TAB
 # -----------------------------------------------------------------------------
-with st.expander("📝 View Raw Historical Data"):
-    st.dataframe(data.tail(50))
-    csv = data.to_csv(index=False).encode('utf-8')
-    st.download_button("Download Historical CSV", data=csv, file_name=f"{selected_stock}_history.csv", mime="text/csv")
+#with st.expander("📝 View Raw Historical Data"):
+#    st.dataframe(data.tail(50))
+#    csv = data.to_csv(index=False).encode('utf-8')
+#    st.download_button("Download Historical CSV", data=csv, file_name=f"{selected_stock}_history.csv", mime="text/csv")
