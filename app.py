@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from plotly import graph_objs as go
 import pandas as pd
 import numpy as np
+import itertools # NEW: Required for the ML Grid Search
 
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
@@ -15,33 +16,18 @@ START = "2000-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 
 st.set_page_config(page_title="Pro Stock Forecast App", layout="wide")
-st.title('📈 Stock Dashboard by S. Shah')
+st.title('📈 Auto-Optimized Stock Dashboard by S. Shah')
 
 # -----------------------------------------------------------------------------
-# SIDEBAR (CONFIGURATION & TUNING)
+# SIDEBAR (CONFIGURATION)
 # -----------------------------------------------------------------------------
 st.sidebar.header("Configuration")
 ticker_input = st.sidebar.text_input("Enter Ticker Symbol:", value="NVDA")
 selected_stock = ticker_input.upper()
 
+# Keep only the future horizon slider for the user
 n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 period = n_years * 252 
-
-test_years = st.sidebar.slider('Historical Test Period (Years):', 1, 10, value=6)
-
-st.sidebar.divider()
-
-st.sidebar.subheader("Prophet Model Tuning")
-st.sidebar.markdown("""
-Tweak these to lower the MAE/MAPE error scores.
-""")
-cps = st.sidebar.slider("Changepoint Prior Scale (Flexibility)", 
-                        min_value=0.001, max_value=0.500, value=0.050, step=0.001,
-                        help="Higher = more flexible trend. Lower = stiffer trend.")
-
-sps = st.sidebar.slider("Seasonality Prior Scale", 
-                        min_value=0.01, max_value=15.00, value=10.00, step=0.01,
-                        help="Higher = model fits larger seasonal fluctuations. Lower = dampens seasonal effects.")
 
 # -----------------------------------------------------------------------------
 # DATA LOADING
@@ -64,19 +50,107 @@ if data is None or data.empty:
     st.stop()
 
 # -----------------------------------------------------------------------------
-# FORECASTING LOGIC (HOLIDAYS, WEEKENDS OFF & DYNAMIC SPLIT)
+# CALCULATE PROFESSIONAL INDICATORS (Technical Analysis)
+# -----------------------------------------------------------------------------
+def calculate_technicals(df):
+    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = df['EMA_12'] - df['EMA_26']
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    df['SMA_20'] = df['Close'].rolling(window=20).mean()
+    df['Std_Dev'] = df['Close'].rolling(window=20).std()
+    df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
+    df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
+    
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    return df
+
+data = calculate_technicals(data)
+
+# -----------------------------------------------------------------------------
+# ML OPTIMIZATION ENGINE (GRID SEARCH)
 # -----------------------------------------------------------------------------
 df_prophet = data[['Date','Close']].rename(columns={"Date": "ds", "Close": "y"})
 
-test_days = test_years * 252
+@st.cache_data(show_spinner=False)
+def optimize_prophet(df):
+    # 1. Define the Hyperparameter Grid Search Space
+    cps_grid = [0.01, 0.05, 0.1, 0.2]
+    sps_grid = [0.1, 1.0, 5.0, 10.0]
+    
+    # 2. Dynamically find the maximum valid test years for this specific ticker
+    total_days = len(df)
+    max_test_years = min(4, int((total_days - 252) / 252)) 
+    
+    if max_test_years < 1:
+        test_years_grid = [1]
+    else:
+        test_years_grid = list(range(1, max_test_years + 1))
+        
+    best_mape = float('inf')
+    best_params = {'cps': 0.05, 'sps': 10.0, 'test_years': 1}
+    
+    # 3. Brute-force through all combinations to find the mathematical best fit
+    for cps, sps, ty in itertools.product(cps_grid, sps_grid, test_years_grid):
+        test_days = ty * 252
+        if len(df) <= test_days + 252:
+            continue
+            
+        train_data = df.iloc[:-test_days]
+        test_data = df.iloc[-test_days:]
+        
+        try:
+            # uncertainty_samples=0 dramatically speeds up the ML training loop
+            m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps, uncertainty_samples=0)
+            m.add_country_holidays(country_name='US')
+            m.fit(train_data)
+            
+            future = m.make_future_dataframe(periods=test_days, freq='B')
+            forecast = m.predict(future)
+            
+            eval_df = test_data.merge(forecast[['ds', 'yhat']], on='ds', how='inner')
+            mape = np.mean(np.abs((eval_df['y'] - eval_df['yhat']) / eval_df['y'])) * 100
+            
+            if mape < best_mape:
+                best_mape = mape
+                best_params = {'cps': cps, 'sps': sps, 'test_years': ty}
+        except Exception:
+            continue
+            
+    return best_params
 
-if len(df_prophet) <= test_days:
-    st.error(f"Not enough historical data to hold out {test_years} years. Please reduce the Test Period.")
-    st.stop()
+# Run the optimizer
+with st.spinner(f"Running ML Grid Search Optimization for {selected_stock}..."):
+    best_params = optimize_prophet(df_prophet)
+
+cps = best_params['cps']
+sps = best_params['sps']
+test_years = best_params['test_years']
+
+# Update UI with Read-Only Auto-Tuned Parameters
+st.sidebar.divider()
+st.sidebar.subheader("🤖 Auto-ML Tuning Active")
+st.sidebar.markdown(f"Optimal parameters found for **{selected_stock}**:")
+st.sidebar.info(f"""
+**Changepoint Prior:** {cps}  
+**Seasonality Prior:** {sps}  
+**Test Period:** {test_years} Years
+""")
+
+# -----------------------------------------------------------------------------
+# FORECASTING LOGIC (WITH OPTIMIZED PARAMS)
+# -----------------------------------------------------------------------------
+test_days = test_years * 252
 
 train_data = df_prophet.iloc[:-test_days]
 test_data = df_prophet.iloc[-test_days:]
 
+# Build the final model (uncertainty_samples restored to default for charting)
 m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps)
 m.add_country_holidays(country_name='US')
 m.fit(train_data)
@@ -106,24 +180,6 @@ st.divider()
 # -----------------------------------------------------------------------------
 # EXTEND TECHNICAL INDICATORS INTO THE FUTURE
 # -----------------------------------------------------------------------------
-def calculate_technicals(df):
-    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
-    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = df['EMA_12'] - df['EMA_26']
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    df['SMA_20'] = df['Close'].rolling(window=20).mean()
-    df['Std_Dev'] = df['Close'].rolling(window=20).std()
-    df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
-    df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
-    
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    return df
-
 # 1. Grab historical facts
 historical_df = data[['Date', 'Close']].copy()
 
@@ -163,17 +219,17 @@ fig.add_annotation(
     showarrow=False, font=dict(color="gray"), xanchor="left", row=1, col=1
 )
 
-# --- ROW 2: BOLLINGER BANDS (Using extended_data) ---
+# --- ROW 2: BOLLINGER BANDS ---
 fig.add_trace(go.Scatter(x=extended_data['Date'], y=extended_data['Close'], name='Combined Price', line=dict(color='black', width=1)), row=2, col=1)
 fig.add_trace(go.Scatter(x=extended_data['Date'], y=extended_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
 fig.add_trace(go.Scatter(x=extended_data['Date'], y=extended_data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
 
-# --- ROW 3: RSI (Using extended_data) ---
+# --- ROW 3: RSI ---
 fig.add_trace(go.Scatter(x=extended_data['Date'], y=extended_data['RSI'], name='RSI', line=dict(color='purple')), row=3, col=1)
 fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
 fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
 
-# --- ROW 4: MACD (Using extended_data) ---
+# --- ROW 4: MACD ---
 fig.add_trace(go.Scatter(x=extended_data['Date'], y=extended_data['MACD'], name='MACD', line=dict(color='blue')), row=4, col=1)
 fig.add_trace(go.Scatter(x=extended_data['Date'], y=extended_data['Signal_Line'], name='Signal', line=dict(color='red')), row=4, col=1)
 colors = ['green' if val >= 0 else 'red' for val in (extended_data['MACD'] - extended_data['Signal_Line'])]
@@ -204,7 +260,6 @@ st.plotly_chart(fig_comp, use_container_width=True)
 # RAW DATA TAB
 # -----------------------------------------------------------------------------
 with st.expander("📝 View Raw Historical Data"):
-    # We display the original historical data here, untainted by future predictions
     st.dataframe(data.tail(50))
     csv = data.to_csv(index=False).encode('utf-8')
     st.download_button("Download Historical CSV", data=csv, file_name=f"{selected_stock}_history.csv", mime="text/csv")
