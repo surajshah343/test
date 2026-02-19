@@ -76,16 +76,23 @@ def engineer_features(df):
     df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
     df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
     
+    # State tracking metrics needed for loop
     df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = df['EMA_12'] - df['EMA_26']
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     
+    # Corrected Wilder's RSI
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    df['Avg_Gain'] = gain.ewm(alpha=1/14, adjust=False).mean()
+    df['Avg_Loss'] = loss.ewm(alpha=1/14, adjust=False).mean()
+    
+    # Safe division to prevent NaNs
+    rs = df['Avg_Gain'] / df['Avg_Loss'].replace(0, np.nan)
+    df['RSI'] = np.where(df['Avg_Loss'] == 0, 100, 100 - (100 / (1 + rs)))
     
     df['Lag_1_Ret'] = df['Close'] / df['Close'].shift(1) - 1
     df['Lag_2_Ret'] = df['Close'] / df['Close'].shift(2) - 1
@@ -152,35 +159,65 @@ else:
 # INSTITUTIONAL AUTOREGRESSIVE FORECAST (GBM + ML RESIDUALS)
 # -----------------------------------------------------------------------------
 def generate_autoregressive_forecast(trained_model, historical_df, start_buffer, dates_to_predict, num_sims):
-    records = start_buffer.to_dict('records')
+    # Pass engineered data so we can extract stateful variables like EMA
+    engineered_hist = engineer_features(historical_df)
+    records = engineered_hist.tail(30).to_dict('records')
     predictions = []
     
-    # 1. Calculate Institutional Structural Parameters (Drift & Volatility)
-    # Use a longer lookback for structural metrics (e.g., 2 years) to prevent reacting to pure noise
     long_term_returns = historical_df['Close'].pct_change().dropna().tail(504) 
     mu = long_term_returns.mean()
     sigma = long_term_returns.std()
     
-    # Stochastic Drift Formula: mu - (0.5 * sigma^2)
     daily_drift = mu - (0.5 * sigma**2)
     
     base_close = records[-1]['Close']
     mc_paths = {f'Sim_{i}': [] for i in range(num_sims)}
     current_mc_prices = {f'Sim_{i}': base_close for i in range(num_sims)}
     
+    # Extract last known states
+    last_ema_12 = records[-1]['EMA_12']
+    last_ema_26 = records[-1]['EMA_26']
+    last_avg_gain = records[-1]['Avg_Gain']
+    last_avg_loss = records[-1]['Avg_Loss']
+    
     for i, date_val in enumerate(dates_to_predict):
         last_rec = records[-1]
         prev_rec = records[-2]
-        closes = [r['Close'] for r in records[-26:]] 
         
         current_close = last_rec['Close']
+        closes = [r['Close'] for r in records[-20:]]
+        
         lag_1_ret = current_close / prev_rec['Close'] - 1
         lag_2_ret = current_close / records[-3]['Close'] - 1
         
-        sma_10 = np.mean(closes[-10:])
-        sma_20 = np.mean(closes[-20:])
-        macd = (np.mean(closes[-12:]) - np.mean(closes[-26:]))
-        vol_20 = np.std([r['Close']/records[idx-1]['Close']-1 for idx, r in enumerate(records[-20:]) if idx > 0])
+        sma_10 = np.mean([r['Close'] for r in records[-10:]])
+        sma_20 = np.mean(closes)
+        
+        # 1. Properly Step EMAs & MACD
+        alpha_12 = 2 / (12 + 1)
+        alpha_26 = 2 / (26 + 1)
+        
+        last_ema_12 = (current_close - last_ema_12) * alpha_12 + last_ema_12
+        last_ema_26 = (current_close - last_ema_26) * alpha_26 + last_ema_26
+        macd = last_ema_12 - last_ema_26
+        
+        # 2. Properly Step Wilder's RSI
+        delta = current_close - prev_rec['Close']
+        gain = delta if delta > 0 else 0
+        loss = -delta if delta < 0 else 0
+        
+        last_avg_gain = gain * (1/14) + last_avg_gain * (1 - 1/14)
+        last_avg_loss = loss * (1/14) + last_avg_loss * (1 - 1/14)
+        
+        if last_avg_loss == 0:
+            rsi = 100
+        else:
+            rs = last_avg_gain / last_avg_loss
+            rsi = 100 - (100 / (1 + rs))
+        
+        # 3. Correct DDOF for Pandas matching Volatility (require 21 prices for 20 returns)
+        recent_returns = [records[idx]['Close'] / records[idx-1]['Close'] - 1 for idx in range(-20, 0)]
+        vol_20 = np.std(recent_returns, ddof=1)
         
         X_pred = pd.DataFrame({
             'Lag_1_Ret': [lag_1_ret],
@@ -188,23 +225,18 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
             'SMA_10_Pct': [(sma_10 / current_close) - 1],
             'SMA_20_Pct': [(sma_20 / current_close) - 1],
             'MACD_Pct': [macd / current_close if current_close != 0 else 0],
-            'RSI': [last_rec.get('RSI', 50)],
+            'RSI': [rsi],
             'Vol_20': [vol_20],
             'DayOfYear': [date_val.dayofyear],
             'Month': [date_val.month]
         })
         
-        # 2. Extract ML Signal
-        # The AI predicts the pure signal. We apply a dampening weight so it doesn't zero out the drift.
         ai_signal = trained_model.predict(X_pred)[0]
-        blended_return = daily_drift + (ai_signal * 0.2) # Institutional blend
+        blended_return = daily_drift + (ai_signal * 0.2) 
         
-        # 3. Step the Baseline Forecast using Log Returns
         new_close = current_close * np.exp(blended_return)
         
-        # 4. Step the Monte Carlo Paths
         for sim_idx in range(num_sims):
-            # Inject normally distributed noise into the log return
             noise = np.random.normal(0, sigma)
             sim_return = blended_return + noise
             
@@ -214,7 +246,6 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
             mc_paths[f'Sim_{sim_idx}'].append(new_sim_price)
             current_mc_prices[f'Sim_{sim_idx}'] = new_sim_price
             
-        # 5. Expand Confidence Intervals (Square Root of Time)
         step_uncertainty_pct = sigma * 1.96 * np.sqrt(i + 1)
         upper_bound = new_close * np.exp(step_uncertainty_pct)
         lower_bound = max(0.01, new_close * np.exp(-step_uncertainty_pct)) 
@@ -222,7 +253,11 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
         new_record = {
             'Date': date_val, 
             'Close': new_close, 
-            'RSI': last_rec.get('RSI', 50),
+            'RSI': rsi,
+            'EMA_12': last_ema_12,
+            'EMA_26': last_ema_26,
+            'Avg_Gain': last_avg_gain,
+            'Avg_Loss': last_avg_loss,
             'Upper_Bound': upper_bound,
             'Lower_Bound': lower_bound
         }
@@ -244,7 +279,6 @@ with st.spinner(f"Running Institutional Forecast & {n_simulations} Simulations..
     last_actual_date = future_start_buffer['Date'].iloc[-1]
     
     future_dates = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=forecast_days, freq='B')
-    # Pass the full 'data' df to calculate structural parameters
     future_forecast, mc_paths_data = generate_autoregressive_forecast(final_model, data, future_start_buffer, future_dates, n_simulations)
 
 plot_buffer = pd.concat([data[['Date', 'Close']], future_forecast[['Date', 'Close']]], ignore_index=True)
@@ -368,17 +402,3 @@ with st.container():
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)', zeroline=False)
 
     st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
-
-# -----------------------------------------------------------------------------
-# CSV EXPORT
-# -----------------------------------------------------------------------------
-#st.divider()
-#st.subheader("📥 Export AI Forecast Data")
-
-#csv = future_forecast.to_csv(index=False).encode('utf-8')
-#st.download_button(
- #   label="Download Baseline Forecast as CSV",
-  #  data=csv,
-   # file_name=f"{selected_stock}_Institutional_Forecast.csv",
-    #mime="text/csv",
-#)
