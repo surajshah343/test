@@ -11,21 +11,26 @@ import numpy as np
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
 # -----------------------------------------------------------------------------
-START = "2015-01-01"
+# Updated starting year to 2000
+START = "2000-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 
 st.set_page_config(page_title="Pro Stock Forecast App", layout="wide")
 st.title('📈 Stock Dashboard by S. Shah')
 
 # -----------------------------------------------------------------------------
-# SIDEBAR (NOW WITH HYPERPARAMETER TUNING)
+# SIDEBAR (CONFIGURATION & TUNING)
 # -----------------------------------------------------------------------------
 st.sidebar.header("Configuration")
 ticker_input = st.sidebar.text_input("Enter Ticker Symbol:", value="NVDA")
 selected_stock = ticker_input.upper()
 
-n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4)
+# Slider for future predictions
+n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 period = n_years * 365
+
+# NEW: Slider for historical test data holdout
+test_years = st.sidebar.slider('Historical Test Period (Years):', 1, 10, value=6)
 
 st.sidebar.divider()
 
@@ -91,12 +96,18 @@ def calculate_technicals(df):
 data = calculate_technicals(data)
 
 # -----------------------------------------------------------------------------
-# FORECASTING LOGIC (WITH 6-YEAR TRAIN/TEST SPLIT & TUNING)
+# FORECASTING LOGIC (DYNAMIC TRAIN/TEST SPLIT & TUNING)
 # -----------------------------------------------------------------------------
 df_prophet = data[['Date','Close']].rename(columns={"Date": "ds", "Close": "y"})
 
-# Define the split: Hold out the last 6 YEARS of data as the "Test" set
-test_days = 1 * 365
+# Define the split dynamically based on user sidebar input
+test_days = test_years * 365
+
+# Ensure we have enough data to split
+if len(df_prophet) <= test_days:
+    st.error(f"Not enough historical data to hold out {test_years} years. Please reduce the Test Period.")
+    st.stop()
+
 train_data = df_prophet.iloc[:-test_days]
 test_data = df_prophet.iloc[-test_days:]
 
@@ -104,7 +115,7 @@ test_data = df_prophet.iloc[-test_days:]
 m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps)
 m.fit(train_data)
 
-# Create future dates (Covering the 6-year test period + the user's future forecast)
+# Create future dates (Covering the dynamic test period + the user's future forecast)
 total_periods = test_days + period
 future = m.make_future_dataframe(periods=total_periods)
 forecast = m.predict(future)
@@ -117,13 +128,13 @@ eval_df = test_data.merge(forecast[['ds', 'yhat']], on='ds', how='inner')
 mae = np.mean(np.abs(eval_df['y'] - eval_df['yhat']))
 mape = np.mean(np.abs((eval_df['y'] - eval_df['yhat']) / eval_df['y'])) * 100
 
-st.subheader("Model Accuracy (Against Last 6 Years Held-Out Data)")
+st.subheader(f"Model Accuracy (Against Last {test_years} Years Held-Out Data)")
 col1, col2, col3 = st.columns(3)
 current_price = data['Close'].iloc[-1]
 
 col1.metric("Current Known Price", f"${current_price:.2f}")
-col2.metric("Mean Absolute Error (MAE)", f"${mae:.2f}", help="Average dollar amount the prediction was off over the last 6 years.")
-col3.metric("MAPE (Percentage Error)", f"{mape:.2f}%", help="Average percentage the prediction was off over the last 6 years.")
+col2.metric("Mean Absolute Error (MAE)", f"${mae:.2f}", help=f"Average dollar amount the prediction was off over the last {test_years} years.")
+col3.metric("MAPE (Percentage Error)", f"{mape:.2f}%", help=f"Average percentage the prediction was off over the last {test_years} years.")
 
 st.divider()
 
