@@ -76,13 +76,11 @@ def engineer_features(df):
     df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
     df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
     
-    # State tracking metrics needed for loop
     df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = df['EMA_12'] - df['EMA_26']
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     
-    # Corrected Wilder's RSI
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -90,7 +88,6 @@ def engineer_features(df):
     df['Avg_Gain'] = gain.ewm(alpha=1/14, adjust=False).mean()
     df['Avg_Loss'] = loss.ewm(alpha=1/14, adjust=False).mean()
     
-    # Safe division to prevent NaNs
     rs = df['Avg_Gain'] / df['Avg_Loss'].replace(0, np.nan)
     df['RSI'] = np.where(df['Avg_Loss'] == 0, 100, 100 - (100 / (1 + rs)))
     
@@ -101,14 +98,25 @@ def engineer_features(df):
     df['MACD_Pct'] = df['MACD'] / df['Close']
     df['Vol_20'] = df['Lag_1_Ret'].rolling(window=20).std()
     
+    # -------------------------------------------------------------
+    # THE FIX: Calculate Base Drift and Target ML Residuals
+    # -------------------------------------------------------------
     df['Daily_Return'] = df['Close'].pct_change()
+    df['Rolling_Drift'] = df['Daily_Return'].rolling(window=50).mean()
+    
+    # Target is what happens tomorrow
     df['Target_Return'] = df['Daily_Return'].shift(-1)
+    
+    # AI ONLY learns to predict the residual (Alpha) above the standard drift
+    df['Target_Residual'] = df['Target_Return'] - df['Rolling_Drift']
     
     return df
 
 all_data_engineered = engineer_features(data)
 features = ['Lag_1_Ret', 'Lag_2_Ret', 'SMA_10_Pct', 'SMA_20_Pct', 'MACD_Pct', 'RSI', 'Vol_20', 'DayOfYear', 'Month']
-target = 'Target_Return'
+
+# The AI now targets the residual, not the total return
+target = 'Target_Residual'
 
 full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 
@@ -159,7 +167,6 @@ else:
 # INSTITUTIONAL AUTOREGRESSIVE FORECAST (GBM + ML RESIDUALS)
 # -----------------------------------------------------------------------------
 def generate_autoregressive_forecast(trained_model, historical_df, start_buffer, dates_to_predict, num_sims):
-    # Pass engineered data so we can extract stateful variables like EMA
     engineered_hist = engineer_features(historical_df)
     records = engineered_hist.tail(30).to_dict('records')
     predictions = []
@@ -174,7 +181,6 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
     mc_paths = {f'Sim_{i}': [] for i in range(num_sims)}
     current_mc_prices = {f'Sim_{i}': base_close for i in range(num_sims)}
     
-    # Extract last known states
     last_ema_12 = records[-1]['EMA_12']
     last_ema_26 = records[-1]['EMA_26']
     last_avg_gain = records[-1]['Avg_Gain']
@@ -193,7 +199,6 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
         sma_10 = np.mean([r['Close'] for r in records[-10:]])
         sma_20 = np.mean(closes)
         
-        # 1. Properly Step EMAs & MACD
         alpha_12 = 2 / (12 + 1)
         alpha_26 = 2 / (26 + 1)
         
@@ -201,7 +206,6 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
         last_ema_26 = (current_close - last_ema_26) * alpha_26 + last_ema_26
         macd = last_ema_12 - last_ema_26
         
-        # 2. Properly Step Wilder's RSI
         delta = current_close - prev_rec['Close']
         gain = delta if delta > 0 else 0
         loss = -delta if delta < 0 else 0
@@ -215,7 +219,6 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
             rs = last_avg_gain / last_avg_loss
             rsi = 100 - (100 / (1 + rs))
         
-        # 3. Correct DDOF for Pandas matching Volatility (require 21 prices for 20 returns)
         recent_returns = [records[idx]['Close'] / records[idx-1]['Close'] - 1 for idx in range(-20, 0)]
         vol_20 = np.std(recent_returns, ddof=1)
         
@@ -231,14 +234,23 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
             'Month': [date_val.month]
         })
         
-        ai_signal = trained_model.predict(X_pred)[0]
-        blended_return = daily_drift + (ai_signal * 0.2) 
+        # -------------------------------------------------------------
+        # THE FIX: True Residual Blending & Stochastic Texture
+        # -------------------------------------------------------------
+        ai_residual = trained_model.predict(X_pred)[0]
         
+        # We inject a standard normal shock to the AI baseline to prevent deterministic collapse
+        baseline_noise = np.random.normal(0, sigma) 
+        
+        # Baseline combines structural drift, AI alpha (residual), and realistic daily noise
+        blended_return = daily_drift + ai_residual + baseline_noise
         new_close = current_close * np.exp(blended_return)
         
+        # Process Monte Carlo sims normally
         for sim_idx in range(num_sims):
             noise = np.random.normal(0, sigma)
-            sim_return = blended_return + noise
+            # Sim paths use the AI residual as their shifting mean, plus independent noise
+            sim_return = daily_drift + ai_residual + noise
             
             new_sim_price = current_mc_prices[f'Sim_{sim_idx}'] * np.exp(sim_return)
             new_sim_price = max(0.01, new_sim_price) 
