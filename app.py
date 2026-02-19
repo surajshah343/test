@@ -118,10 +118,10 @@ full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Model Performance (Holdout Set)")
 
-# 80/20 chronological split to test how the model behaves on unseen recent data
 split_idx = int(len(full_ml_data) * 0.8)
 train_eval = full_ml_data.iloc[:split_idx]
 test_eval = full_ml_data.iloc[split_idx:]
+split_date = test_eval['Date'].iloc[0] # Capture the exact date where the holdout begins
 
 eval_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
 eval_model.fit(train_eval[features], train_eval[target])
@@ -131,7 +131,6 @@ actuals = test_eval[target]
 
 mae = mean_absolute_error(actuals, predictions)
 rmse = np.sqrt(mean_squared_error(actuals, predictions))
-# To avoid MAPE explosion when actuals are near 0, add a tiny epsilon
 mape = mean_absolute_percentage_error(actuals + 1e-8, predictions + 1e-8)
 
 col1, col2 = st.sidebar.columns(2)
@@ -326,7 +325,7 @@ fig_imp.update_layout(
 )
 fig_imp.update_xaxes(showgrid=True, gridcolor='rgba(230,230,230,0.5)')
 st.sidebar.divider()
-st.sidebar.plotly_chart(fig_imp, use_container_width=True, config={'displayModeBar': False})
+st.sidebar.plotly_chart(fig_imp, use_container_width=True, config={'displayModeBar': True}) # Enabled displayModeBar here too
 
 # -----------------------------------------------------------------------------
 # MASTER DASHBOARD VISUALIZATION
@@ -347,7 +346,15 @@ with st.container():
         row_heights=[0.5, 0.15, 0.15, 0.2] 
     )
 
-    fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name='Historical Data', mode='lines', line=dict(color='black', width=1.5)), row=1, col=1)
+    # -------------------------------------------------------------------------
+    # Splitting historical data purely for visualization
+    # -------------------------------------------------------------------------
+    train_plot_data = data[data['Date'] < split_date]
+    test_plot_data = data[data['Date'] >= split_date]
+
+    fig.add_trace(go.Scatter(x=train_plot_data['Date'], y=train_plot_data['Close'], name='Train Data', mode='lines', line=dict(color='black', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=test_plot_data['Date'], y=test_plot_data['Close'], name='Test Data', mode='lines', line=dict(color='orange', width=1.5)), row=1, col=1)
+    
     fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='AI Baseline Forecast', mode='lines', line=dict(color='blue', width=2.5)), row=1, col=1)
 
     for sim_key, path_prices in mc_paths_data.items():
@@ -393,8 +400,12 @@ with st.container():
     macd_colors = ['rgba(0,128,0,0.6)' if val >= 0 else 'rgba(255,0,0,0.6)' for val in macd_hist]
     fig.add_trace(go.Bar(x=plot_data['Date'], y=macd_hist, name='Hist', marker_color=macd_colors), row=4, col=1)
 
+    # Adding reference lines for split dates and today
     for r in range(1, 5):
+        fig.add_vline(x=split_date, line_dash="dash", line_color="orange", opacity=0.6, row=r, col=1)
         fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", opacity=0.6, row=r, col=1)
+        
+    fig.add_annotation(x=split_date, y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="orange", size=10), xanchor="right", row=1, col=1)
     fig.add_annotation(x=last_actual_date, y=1.05, yref="paper", text="Today", showarrow=False, font=dict(color="green", size=10), xanchor="left", row=1, col=1)
 
     fig.update_layout(
@@ -417,4 +428,8 @@ with st.container():
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)')
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)', zeroline=False)
 
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    # -------------------------------------------------------------------------
+    # Changed config to default to True so interactive scaling/zoom options appear
+    # -------------------------------------------------------------------------
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'scrollZoom': True})
+    
