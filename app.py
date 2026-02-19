@@ -121,7 +121,7 @@ st.sidebar.subheader("📊 Model Performance (Holdout Set)")
 split_idx = int(len(full_ml_data) * 0.8)
 train_eval = full_ml_data.iloc[:split_idx]
 test_eval = full_ml_data.iloc[split_idx:]
-split_date = test_eval['Date'].iloc[0] # Capture the exact date where the holdout begins
+split_date = test_eval['Date'].iloc[0] 
 
 eval_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
 eval_model.fit(train_eval[features], train_eval[target])
@@ -134,9 +134,10 @@ rmse = np.sqrt(mean_squared_error(actuals, predictions))
 mape = mean_absolute_percentage_error(actuals + 1e-8, predictions + 1e-8)
 
 col1, col2 = st.sidebar.columns(2)
-col1.metric("MAE (Residual)", f"{mae:.4f}")
-col2.metric("RMSE", f"{rmse:.4f}")
-st.sidebar.metric("MAPE (Residual Volatility)", f"{mape:.2%}")
+# Added informative tooltips using Streamlit's native 'help' parameter
+col1.metric("MAE (Residual)", f"{mae:.4f}", help="Mean Absolute Error: The average absolute difference between the AI's predicted residual and the actual market residual. A lower value indicates higher predictive accuracy.")
+col2.metric("RMSE", f"{rmse:.4f}", help="Root Mean Squared Error: Similar to MAE, but heavily penalizes larger errors. Compare this to historical standard deviation to gauge performance.")
+st.sidebar.metric("MAPE (Residual Volatility)", f"{mape:.2%}", help="Mean Absolute Percentage Error: Shows the error as a percentage. Note: Because stock residuals hover near zero, this value can artificially spike, so evaluate it alongside MAE.")
 st.sidebar.caption("Evaluated chronologically on the most recent 20% of historical data.")
 
 # -----------------------------------------------------------------------------
@@ -313,10 +314,19 @@ fig_imp = go.Figure(go.Bar(
     marker_color='teal',
     opacity=0.8
 ))
+
+# Added Question Mark tooltip to the Feature Importance chart
+fig_imp.add_annotation(
+    x=1.0, y=1.1, xref="paper", yref="paper",
+    text="<b>?</b>", showarrow=False,
+    font=dict(color="white", size=11), bgcolor="rgba(100,100,100,0.6)", borderpad=4,
+    hovertext="Feature Importance: Ranks which technical indicators the AI uses most to predict returns. Longer bars = heavier influence."
+)
+
 fig_imp.update_layout(
     title="Model's Current Feature Weights",
     title_font_size=14,
-    margin=dict(l=0, r=0, t=30, b=0),
+    margin=dict(l=0, r=0, t=40, b=0),
     height=250,
     xaxis_title="Relative Importance Weight",
     yaxis_title=None,
@@ -325,7 +335,7 @@ fig_imp.update_layout(
 )
 fig_imp.update_xaxes(showgrid=True, gridcolor='rgba(230,230,230,0.5)')
 st.sidebar.divider()
-st.sidebar.plotly_chart(fig_imp, use_container_width=True, config={'displayModeBar': True}) # Enabled displayModeBar here too
+st.sidebar.plotly_chart(fig_imp, use_container_width=True, config={'displayModeBar': True}) 
 
 # -----------------------------------------------------------------------------
 # MASTER DASHBOARD VISUALIZATION
@@ -346,9 +356,6 @@ with st.container():
         row_heights=[0.5, 0.15, 0.15, 0.2] 
     )
 
-    # -------------------------------------------------------------------------
-    # Splitting historical data purely for visualization
-    # -------------------------------------------------------------------------
     train_plot_data = data[data['Date'] < split_date]
     test_plot_data = data[data['Date'] >= split_date]
 
@@ -400,13 +407,33 @@ with st.container():
     macd_colors = ['rgba(0,128,0,0.6)' if val >= 0 else 'rgba(255,0,0,0.6)' for val in macd_hist]
     fig.add_trace(go.Bar(x=plot_data['Date'], y=macd_hist, name='Hist', marker_color=macd_colors), row=4, col=1)
 
-    # Adding reference lines for split dates and today
     for r in range(1, 5):
         fig.add_vline(x=split_date, line_dash="dash", line_color="orange", opacity=0.6, row=r, col=1)
         fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", opacity=0.6, row=r, col=1)
         
     fig.add_annotation(x=split_date, y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="orange", size=10), xanchor="right", row=1, col=1)
     fig.add_annotation(x=last_actual_date, y=1.05, yref="paper", text="Today", showarrow=False, font=dict(color="green", size=10), xanchor="left", row=1, col=1)
+
+    # -------------------------------------------------------------------------
+    # Add floating Question Mark tooltips to each subplot in the master layout
+    # -------------------------------------------------------------------------
+    hover_texts = [
+        "Forecast Plot: Black/Orange = Historical Train/Test. Blue = AI Expected Path. Shaded region = 95% Monte Carlo Confidence Interval.",
+        "Bollinger Bands: Measures volatility. Price pushing the Upper Band indicates overbought; pushing Lower Band indicates oversold.",
+        "RSI (Relative Strength Index): Momentum oscillator. Values >70 are typically overbought, <30 are oversold.",
+        "MACD: Trend momentum. Green bars = bullish momentum, Red = bearish. Line crossovers signal potential reversals."
+    ]
+    
+    for idx, text in enumerate(hover_texts, start=1):
+        xref = "x domain" if idx == 1 else f"x{idx} domain"
+        yref = "y domain" if idx == 1 else f"y{idx} domain"
+        
+        fig.add_annotation(
+            x=0.01, y=0.95, xref=xref, yref=yref,
+            text="<b>?</b>", showarrow=False,
+            font=dict(color="white", size=11), bgcolor="rgba(100,100,100,0.5)", borderpad=4,
+            hovertext=text
+        )
 
     fig.update_layout(
         height=900, 
@@ -428,8 +455,4 @@ with st.container():
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)')
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)', zeroline=False)
 
-    # -------------------------------------------------------------------------
-    # Changed config to default to True so interactive scaling/zoom options appear
-    # -------------------------------------------------------------------------
     st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'scrollZoom': True})
-    
