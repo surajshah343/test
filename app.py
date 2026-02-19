@@ -21,7 +21,6 @@ os.makedirs("saved_models", exist_ok=True)
 
 st.set_page_config(page_title="AI Pro Dashboard", layout="wide")
 
-# Title with "How to read" popover
 t1, t2 = st.columns([0.9, 0.1])
 with t1:
     st.title('🧠 Continuous Learning AI Dashboard by S. Shah')
@@ -37,7 +36,7 @@ n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 forecast_days = n_years * 252 
 n_simulations = st.sidebar.slider('Monte Carlo Paths:', 0, 50, value=20)
 
-# Toggle for simulation paths
+# Toggle added here - calculation is now cached below to prevent re-runs
 show_paths = st.sidebar.toggle("Show Individual Sim Paths", value=True)
 
 MODEL_FILE = f"saved_models/{selected_stock}_continuous_model.json"
@@ -66,7 +65,7 @@ if data is None or data.empty:
     st.stop()
 
 # -----------------------------------------------------------------------------
-# FEATURE ENGINEERING
+# FEATURE ENGINEERING & TECHNICAL INDICATORS
 # -----------------------------------------------------------------------------
 def engineer_features(df):
     df = df.copy()
@@ -110,8 +109,22 @@ target = 'Target_Residual'
 full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 
 # -----------------------------------------------------------------------------
-# TRAINING
+# EVALUATION & TRAINING
 # -----------------------------------------------------------------------------
+split_idx = int(len(full_ml_data) * 0.8)
+train_eval, test_eval = full_ml_data.iloc[:split_idx], full_ml_data.iloc[split_idx:]
+split_date = test_eval['Date'].iloc[0]
+
+quick_eval_model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
+quick_eval_model.fit(train_eval[features], train_eval[target])
+eval_preds = quick_eval_model.predict(test_eval[features])
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📊 Accuracy Metrics")
+c1, c2 = st.sidebar.columns(2)
+c1.metric("MAE", f"{mean_absolute_error(test_eval[target], eval_preds):.4f}")
+c2.metric("RMSE", f"{np.sqrt(mean_squared_error(test_eval[target], eval_preds)):.4f}")
+
 final_model = xgb.XGBRegressor()
 if not os.path.exists(MODEL_FILE):
     tuner = RandomizedSearchCV(xgb.XGBRegressor(random_state=42), {'max_depth': [3, 5], 'n_estimators': [100]}, n_iter=2, cv=2)
@@ -123,25 +136,27 @@ else:
     final_model.load_model(MODEL_FILE)
 
 # -----------------------------------------------------------------------------
-# CACHED FORECAST GENERATION
+# CACHED FORECAST GENERATION (Includes Progress Bar)
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def get_cached_forecast(_model, _historical_df, _dates, _sims):
+def generate_forecast_cached(_model, _historical_df, _dates, _num_sims):
     hist_eng = engineer_features(_historical_df)
     records = hist_eng.tail(30).to_dict('records')
     returns_tail = _historical_df['Close'].pct_change().dropna().tail(504)
     mu, sigma = returns_tail.mean(), returns_tail.std()
     daily_drift = mu - (0.5 * sigma**2)
     
-    mc_paths = {f'Sim_{i}': [] for i in range(_sims)}
-    current_mc_prices = {f'Sim_{i}': records[-1]['Close'] for i in range(_sims)}
+    mc_paths = {f'Sim_{i}': [] for i in range(_num_sims)}
+    current_mc_prices = {f'Sim_{i}': records[-1]['Close'] for i in range(_num_sims)}
     l_ema12, l_ema26 = records[-1]['EMA_12'], records[-1]['EMA_26']
     l_gain, l_loss = records[-1]['Avg_Gain'], records[-1]['Avg_Loss']
     
     preds = []
-    progress_bar = st.progress(0, text="Calculating AI Forecast Steps...")
     
-    total_steps = len(_dates)
+    # Progress Bar setup
+    prog_text = "Executing AI Recursive Forecast..."
+    my_bar = st.progress(0, text=prog_text)
+    
     for i, date_val in enumerate(_dates):
         c_price = records[-1]['Close']
         l_ema12 = (c_price - l_ema12) * (2/13) + l_ema12
@@ -165,7 +180,7 @@ def get_cached_forecast(_model, _historical_df, _dates, _sims):
         f_return = daily_drift + ai_alpha + np.random.normal(0, sigma)
         new_close = c_price * np.exp(f_return)
         
-        for s in range(_sims):
+        for s in range(_num_sims):
             s_ret = daily_drift + ai_alpha + np.random.normal(0, sigma)
             new_s_p = current_mc_prices[f'Sim_{s}'] * np.exp(s_ret)
             mc_paths[f'Sim_{s}'].append(max(0.01, new_s_p))
@@ -176,25 +191,23 @@ def get_cached_forecast(_model, _historical_df, _dates, _sims):
         records.append(rec); preds.append(rec)
         if len(records) > 60: records.pop(0)
         
-        # Update progress bar
-        if i % 20 == 0 or i == total_steps - 1:
-            progress_bar.progress((i + 1) / total_steps, text=f"Step {i+1} of {total_steps} complete...")
-
-    progress_bar.empty()
+        # Update progress
+        my_bar.progress((i + 1) / len(_dates), text=prog_text)
+    
+    my_bar.empty()
     return pd.DataFrame(preds), mc_paths
 
 # Execution
 future_dates = pd.date_range(start=data['Date'].iloc[-1] + pd.Timedelta(days=1), periods=forecast_days, freq='B')
-f_forecast, mc_paths = get_cached_forecast(final_model, data, future_dates, n_simulations)
+f_forecast, mc_paths = generate_forecast_cached(final_model, data, future_dates, n_simulations)
 
 # -----------------------------------------------------------------------------
 # PLOTTING
 # -----------------------------------------------------------------------------
 plot_data = engineer_features(pd.concat([data, f_forecast], ignore_index=True))
-split_date = full_ml_data.iloc[int(len(full_ml_data) * 0.8)]['Date']
 
 fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.4, 0.2, 0.2, 0.2],
-                    subplot_titles=('Institutional Forecast', 'Bollinger Bands', 'RSI', 'MACD'))
+                    subplot_titles=('Institutional Forecast', 'Bollinger Bands (Price vs Volatility)', 'RSI (Momentum)', 'MACD (Trend)'))
 
 fig.add_trace(go.Scatter(x=data[data['Date'] < split_date]['Date'], y=data[data['Date'] < split_date]['Close'], name='Train', line=dict(color='black')), row=1, col=1)
 fig.add_trace(go.Scatter(x=data[data['Date'] >= split_date]['Date'], y=data[data['Date'] >= split_date]['Close'], name='Test', line=dict(color='limegreen')), row=1, col=1)
@@ -220,12 +233,10 @@ fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], line=d
 colors = ['green' if val >= 0 else 'red' for val in plot_data['MACD_Hist']]
 fig.add_trace(go.Bar(x=plot_data['Date'], y=plot_data['MACD_Hist'], marker_color=colors, name='MACD Histogram'), row=4, col=1)
 
-# Annotations/Tooltips
-tooltips = [(1, "Forecast Main"), (2, "Bollinger Bands"), (3, "RSI Momentum"), (4, "MACD Trend")]
-for row, txt in tooltips:
+for row, txt in [(1, "Forecast Info"), (2, "Volatility Info"), (3, "Momentum Info"), (4, "Trend Info")]:
     fig.add_annotation(x=0.01, y=0.95, xref=f"x{row if row > 1 else ''} domain", yref=f"y{row if row > 1 else ''} domain",
                        text="<b>?</b>", showarrow=False, bgcolor="black", font=dict(color="white"), hovertext=txt)
 
-fig.update_yaxes(range=[0, data['Close'].iloc[-1] * 3.5], row=1, col=1)
+fig.update_yaxes(range=[0, data['Close'].iloc[-1] * 3], row=1, col=1)
 fig.update_layout(height=1100, template='plotly_white', hovermode='x unified', legend=dict(orientation="h", y=1.02))
 st.plotly_chart(fig, use_container_width=True)
