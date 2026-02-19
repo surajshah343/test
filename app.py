@@ -15,23 +15,17 @@ import xgboost as xgb
 START = "1995-01-01" 
 TODAY = date.today().strftime("%Y-%m-%d")
 
-# Create a directory to store the "brain" and metadata
 os.makedirs("saved_models", exist_ok=True)
 
 st.set_page_config(page_title="Pro Dashboard", layout="wide")
 st.title('🧠 Continuous Learning AI Dashboard by S. Shah')
 
-# -----------------------------------------------------------------------------
-# SIDEBAR (CONFIGURATION)
-# -----------------------------------------------------------------------------
 st.sidebar.header("Configuration")
 ticker_input = st.sidebar.text_input("Enter Ticker Symbol:", value="NVDA")
 selected_stock = ticker_input.upper()
 
 n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 forecast_days = n_years * 252 
-
-# NEW: Toggle for Monte Carlo Simulations
 n_simulations = st.sidebar.slider('Monte Carlo Paths:', 0, 50, value=20)
 
 MODEL_FILE = f"saved_models/{selected_stock}_continuous_model.json"
@@ -76,7 +70,6 @@ def engineer_features(df):
     df['DayOfYear'] = df['Date'].dt.dayofyear
     df['Month'] = df['Date'].dt.month
     
-    # Standard Indicators
     df['SMA_10'] = df['Close'].rolling(window=10).mean()
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['Std_Dev'] = df['Close'].rolling(window=20).std()
@@ -94,7 +87,6 @@ def engineer_features(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # ML Features
     df['Lag_1_Ret'] = df['Close'] / df['Close'].shift(1) - 1
     df['Lag_2_Ret'] = df['Close'] / df['Close'].shift(2) - 1
     df['SMA_10_Pct'] = df['SMA_10'] / df['Close'] - 1
@@ -157,17 +149,21 @@ else:
         st.sidebar.success("✅ AI Brain up to date!")
 
 # -----------------------------------------------------------------------------
-# AUTOREGRESSIVE FORECAST WITH CONFIDENCE INTERVALS & MONTE CARLO
+# INSTITUTIONAL AUTOREGRESSIVE FORECAST (GBM + ML RESIDUALS)
 # -----------------------------------------------------------------------------
-def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predict, num_sims):
+def generate_autoregressive_forecast(trained_model, historical_df, start_buffer, dates_to_predict, num_sims):
     records = start_buffer.to_dict('records')
     predictions = []
     
-    recent_returns = [(records[idx]['Close'] / records[idx-1]['Close']) - 1 for idx in range(len(records)-20, len(records))]
-    recent_volatility_pct = np.std(recent_returns)
+    # 1. Calculate Institutional Structural Parameters (Drift & Volatility)
+    # Use a longer lookback for structural metrics (e.g., 2 years) to prevent reacting to pure noise
+    long_term_returns = historical_df['Close'].pct_change().dropna().tail(504) 
+    mu = long_term_returns.mean()
+    sigma = long_term_returns.std()
     
-    # Initialize dictionary to hold Monte Carlo paths.
-    # We skip the very first day's initial seed for alignment.
+    # Stochastic Drift Formula: mu - (0.5 * sigma^2)
+    daily_drift = mu - (0.5 * sigma**2)
+    
     base_close = records[-1]['Close']
     mc_paths = {f'Sim_{i}': [] for i in range(num_sims)}
     current_mc_prices = {f'Sim_{i}': base_close for i in range(num_sims)}
@@ -175,7 +171,6 @@ def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predi
     for i, date_val in enumerate(dates_to_predict):
         last_rec = records[-1]
         prev_rec = records[-2]
-        
         closes = [r['Close'] for r in records[-26:]] 
         
         current_close = last_rec['Close']
@@ -199,28 +194,30 @@ def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predi
             'Month': [date_val.month]
         })
         
-        # 1. Base AI Prediction
-        predicted_return = trained_model.predict(X_pred)[0]
-        new_close = current_close * (1 + predicted_return)
+        # 2. Extract ML Signal
+        # The AI predicts the pure signal. We apply a dampening weight so it doesn't zero out the drift.
+        ai_signal = trained_model.predict(X_pred)[0]
+        blended_return = daily_drift + (ai_signal * 0.2) # Institutional blend
         
-        # 2. Monte Carlo Iteration
+        # 3. Step the Baseline Forecast using Log Returns
+        new_close = current_close * np.exp(blended_return)
+        
+        # 4. Step the Monte Carlo Paths
         for sim_idx in range(num_sims):
-            # Inject normally distributed noise into the return
-            noise = np.random.normal(0, recent_volatility_pct)
-            sim_return = predicted_return + noise
+            # Inject normally distributed noise into the log return
+            noise = np.random.normal(0, sigma)
+            sim_return = blended_return + noise
             
-            # Step the simulation price forward
-            new_sim_price = current_mc_prices[f'Sim_{sim_idx}'] * (1 + sim_return)
-            # Prevent negative prices
+            new_sim_price = current_mc_prices[f'Sim_{sim_idx}'] * np.exp(sim_return)
             new_sim_price = max(0.01, new_sim_price) 
             
             mc_paths[f'Sim_{sim_idx}'].append(new_sim_price)
             current_mc_prices[f'Sim_{sim_idx}'] = new_sim_price
-        
-        # 3. Confidence Interval Logic
-        step_uncertainty_pct = recent_volatility_pct * 1.96 * np.sqrt(i + 1)
-        upper_bound = new_close * (1 + step_uncertainty_pct)
-        lower_bound = max(0.01, new_close * (1 - step_uncertainty_pct)) 
+            
+        # 5. Expand Confidence Intervals (Square Root of Time)
+        step_uncertainty_pct = sigma * 1.96 * np.sqrt(i + 1)
+        upper_bound = new_close * np.exp(step_uncertainty_pct)
+        lower_bound = max(0.01, new_close * np.exp(-step_uncertainty_pct)) 
         
         new_record = {
             'Date': date_val, 
@@ -242,12 +239,13 @@ def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predi
 # -----------------------------------------------------------------------------
 # FUTURE FORECAST GENERATION
 # -----------------------------------------------------------------------------
-with st.spinner(f"Generating Forecast & {n_simulations} Simulations..."):
+with st.spinner(f"Running Institutional Forecast & {n_simulations} Simulations..."):
     future_start_buffer = data[['Date', 'Close']].tail(30).copy()
     last_actual_date = future_start_buffer['Date'].iloc[-1]
     
     future_dates = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=forecast_days, freq='B')
-    future_forecast, mc_paths_data = generate_autoregressive_forecast(final_model, future_start_buffer, future_dates, n_simulations)
+    # Pass the full 'data' df to calculate structural parameters
+    future_forecast, mc_paths_data = generate_autoregressive_forecast(final_model, data, future_start_buffer, future_dates, n_simulations)
 
 plot_buffer = pd.concat([data[['Date', 'Close']], future_forecast[['Date', 'Close']]], ignore_index=True)
 plot_data = engineer_features(plot_buffer)
@@ -291,7 +289,7 @@ with st.container():
         shared_xaxes=True, 
         vertical_spacing=0.04, 
         subplot_titles=(
-            f'{selected_stock} AI Forecast, Confidence & Monte Carlo', 
+            f'{selected_stock} Institutional Forecast, Confidence & Monte Carlo', 
             'Bollinger Bands', 
             'RSI', 
             'MACD'
@@ -299,13 +297,9 @@ with st.container():
         row_heights=[0.5, 0.15, 0.15, 0.2] 
     )
 
-    # Historical Data
     fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name='Historical Data', mode='lines', line=dict(color='black', width=1.5)), row=1, col=1)
-    
-    # AI Future Forecast (Baseline)
-    fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='AI Future Forecast', mode='lines', line=dict(color='blue', width=2.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='AI Baseline Forecast', mode='lines', line=dict(color='blue', width=2.5)), row=1, col=1)
 
-    # Plot Monte Carlo Paths (Faint Lines inside the cone)
     for sim_key, path_prices in mc_paths_data.items():
         fig.add_trace(go.Scatter(
             x=future_forecast['Date'],
@@ -316,7 +310,6 @@ with st.container():
             hoverinfo='skip' 
         ), row=1, col=1)
 
-    # Confidence Interval Cone
     fig.add_trace(go.Scatter(
         x=future_forecast['Date'], 
         y=future_forecast['Upper_Bound'], 
@@ -335,17 +328,14 @@ with st.container():
         showlegend=True
     ), row=1, col=1)
 
-    # Bollinger Bands
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
 
-    # RSI
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['RSI'], name='RSI', line=dict(color='purple', width=1.5)), row=3, col=1)
     fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,0,0,0.5)", row=3, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,128,0,0.5)", row=3, col=1)
 
-    # MACD
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['MACD'], name='MACD', line=dict(color='blue', width=1.5)), row=4, col=1)
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], name='Signal', line=dict(color='red', width=1.5)), row=4, col=1)
 
@@ -387,8 +377,8 @@ with st.container():
 
 #csv = future_forecast.to_csv(index=False).encode('utf-8')
 #st.download_button(
-#    label="Download Baseline Forecast as CSV",
-#    data=csv,
-#    file_name=f"{selected_stock}_AI_Forecast_With_Confidence.csv",
- #   mime="text/csv",
+ #   label="Download Baseline Forecast as CSV",
+  #  data=csv,
+   # file_name=f"{selected_stock}_Institutional_Forecast.csv",
+    #mime="text/csv",
 #)
