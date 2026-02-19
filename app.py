@@ -8,6 +8,7 @@ from plotly import graph_objs as go
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
 
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
@@ -98,30 +99,49 @@ def engineer_features(df):
     df['MACD_Pct'] = df['MACD'] / df['Close']
     df['Vol_20'] = df['Lag_1_Ret'].rolling(window=20).std()
     
-    # -------------------------------------------------------------
-    # THE FIX: Calculate Base Drift and Target ML Residuals
-    # -------------------------------------------------------------
     df['Daily_Return'] = df['Close'].pct_change()
     df['Rolling_Drift'] = df['Daily_Return'].rolling(window=50).mean()
-    
-    # Target is what happens tomorrow
     df['Target_Return'] = df['Daily_Return'].shift(-1)
-    
-    # AI ONLY learns to predict the residual (Alpha) above the standard drift
     df['Target_Residual'] = df['Target_Return'] - df['Rolling_Drift']
     
     return df
 
 all_data_engineered = engineer_features(data)
 features = ['Lag_1_Ret', 'Lag_2_Ret', 'SMA_10_Pct', 'SMA_20_Pct', 'MACD_Pct', 'RSI', 'Vol_20', 'DayOfYear', 'Month']
-
-# The AI now targets the residual, not the total return
 target = 'Target_Residual'
 
 full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 
 # -----------------------------------------------------------------------------
-# CONTINUOUS LEARNING ENGINE
+# OUT-OF-SAMPLE EVALUATION (CHRONOLOGICAL SPLIT)
+# -----------------------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("📊 Model Performance (Holdout Set)")
+
+# 80/20 chronological split to test how the model behaves on unseen recent data
+split_idx = int(len(full_ml_data) * 0.8)
+train_eval = full_ml_data.iloc[:split_idx]
+test_eval = full_ml_data.iloc[split_idx:]
+
+eval_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
+eval_model.fit(train_eval[features], train_eval[target])
+
+predictions = eval_model.predict(test_eval[features])
+actuals = test_eval[target]
+
+mae = mean_absolute_error(actuals, predictions)
+rmse = np.sqrt(mean_squared_error(actuals, predictions))
+# To avoid MAPE explosion when actuals are near 0, add a tiny epsilon
+mape = mean_absolute_percentage_error(actuals + 1e-8, predictions + 1e-8)
+
+col1, col2 = st.sidebar.columns(2)
+col1.metric("MAE (Residual)", f"{mae:.4f}")
+col2.metric("RMSE", f"{rmse:.4f}")
+st.sidebar.metric("MAPE (Residual Volatility)", f"{mape:.2%}")
+st.sidebar.caption("Evaluated chronologically on the most recent 20% of historical data.")
+
+# -----------------------------------------------------------------------------
+# CONTINUOUS LEARNING ENGINE (TRAINING ON ALL DATA FOR FUTURE FORECAST)
 # -----------------------------------------------------------------------------
 final_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
 is_new_model = not os.path.exists(MODEL_FILE)
@@ -137,8 +157,6 @@ if is_new_model:
         
         with open(META_FILE, 'w') as f:
             json.dump({"last_trained_date": latest_available_date}, f)
-            
-        st.sidebar.success("✅ Baseline Brain Saved!")
 else:
     final_model.load_model(MODEL_FILE)
     
@@ -149,19 +167,13 @@ else:
             last_trained_date = meta.get("last_trained_date", "1990-01-01")
     
     if latest_available_date > last_trained_date:
-        st.sidebar.info("🧠 New market data detected. Updating pathways...")
         new_data = trainable_data[trainable_data['Date'] > last_trained_date]
-        
         if not new_data.empty:
-            with st.spinner("Learning from recent mistakes..."):
+            with st.spinner("Learning from recent market data..."):
                 final_model.fit(new_data[features], new_data[target], xgb_model=MODEL_FILE)
                 final_model.save_model(MODEL_FILE)
-                
                 with open(META_FILE, 'w') as f:
                     json.dump({"last_trained_date": latest_available_date}, f)
-                st.sidebar.success("✅ Brain updated with recent behavior.")
-    else:
-        st.sidebar.success("✅ AI Brain up to date!")
 
 # -----------------------------------------------------------------------------
 # INSTITUTIONAL AUTOREGRESSIVE FORECAST (GBM + ML RESIDUALS)
@@ -234,22 +246,14 @@ def generate_autoregressive_forecast(trained_model, historical_df, start_buffer,
             'Month': [date_val.month]
         })
         
-        # -------------------------------------------------------------
-        # THE FIX: True Residual Blending & Stochastic Texture
-        # -------------------------------------------------------------
         ai_residual = trained_model.predict(X_pred)[0]
-        
-        # We inject a standard normal shock to the AI baseline to prevent deterministic collapse
         baseline_noise = np.random.normal(0, sigma) 
         
-        # Baseline combines structural drift, AI alpha (residual), and realistic daily noise
         blended_return = daily_drift + ai_residual + baseline_noise
         new_close = current_close * np.exp(blended_return)
         
-        # Process Monte Carlo sims normally
         for sim_idx in range(num_sims):
             noise = np.random.normal(0, sigma)
-            # Sim paths use the AI residual as their shifting mean, plus independent noise
             sim_return = daily_drift + ai_residual + noise
             
             new_sim_price = current_mc_prices[f'Sim_{sim_idx}'] * np.exp(sim_return)
