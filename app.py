@@ -2,7 +2,7 @@ import streamlit as st
 from datetime import date
 import yfinance as yf
 from prophet import Prophet
-from prophet.plot import plot_components_plotly # NEW IMPORT FOR COMPONENT GRAPHS
+from prophet.plot import plot_components_plotly
 from plotly.subplots import make_subplots
 from plotly import graph_objs as go
 import pandas as pd
@@ -33,12 +33,12 @@ st.sidebar.subheader("Prophet Model Tuning")
 st.sidebar.markdown("""
 Tweak these to lower the MAE/MAPE error scores.
 """)
-# Changepoint Prior Scale: default is 0.05
+# Changepoint Prior Scale
 cps = st.sidebar.slider("Changepoint Prior Scale (Flexibility)", 
                         min_value=0.001, max_value=0.500, value=0.050, step=0.001,
-                        help="Higher = more flexible trend (risks overfitting). Lower = stiffer trend (risks underfitting).")
+                        help="Higher = more flexible trend. Lower = stiffer trend.")
 
-# Seasonality Prior Scale: default is 10.0
+# Seasonality Prior Scale
 sps = st.sidebar.slider("Seasonality Prior Scale", 
                         min_value=0.01, max_value=15.00, value=10.00, step=0.01,
                         help="Higher = model fits larger seasonal fluctuations. Lower = dampens seasonal effects.")
@@ -91,20 +91,20 @@ def calculate_technicals(df):
 data = calculate_technicals(data)
 
 # -----------------------------------------------------------------------------
-# FORECASTING LOGIC (WITH TRAIN/TEST SPLIT & TUNING)
+# FORECASTING LOGIC (WITH 6-YEAR TRAIN/TEST SPLIT & TUNING)
 # -----------------------------------------------------------------------------
 df_prophet = data[['Date','Close']].rename(columns={"Date": "ds", "Close": "y"})
 
-# Define the split: Hold out the last 365 days of data as the "Test" set
-test_days = 365
+# Define the split: Hold out the last 6 YEARS of data as the "Test" set
+test_days = 6 * 365
 train_data = df_prophet.iloc[:-test_days]
 test_data = df_prophet.iloc[-test_days:]
 
-# Train the model ONLY on the older training data, applying the sidebar hyperparameters
+# Train the model ONLY on the older training data
 m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps)
 m.fit(train_data)
 
-# Create future dates (Covering the 1-year test period + the user's future forecast)
+# Create future dates (Covering the 6-year test period + the user's future forecast)
 total_periods = test_days + period
 future = m.make_future_dataframe(periods=total_periods)
 forecast = m.predict(future)
@@ -117,13 +117,13 @@ eval_df = test_data.merge(forecast[['ds', 'yhat']], on='ds', how='inner')
 mae = np.mean(np.abs(eval_df['y'] - eval_df['yhat']))
 mape = np.mean(np.abs((eval_df['y'] - eval_df['yhat']) / eval_df['y'])) * 100
 
-st.subheader("Model Accuracy (Against Last 365 Days Held-Out Data)")
+st.subheader("Model Accuracy (Against Last 6 Years Held-Out Data)")
 col1, col2, col3 = st.columns(3)
 current_price = data['Close'].iloc[-1]
 
 col1.metric("Current Known Price", f"${current_price:.2f}")
-col2.metric("Mean Absolute Error (MAE)", f"${mae:.2f}", help="Average dollar amount the prediction was off.")
-col3.metric("MAPE (Percentage Error)", f"{mape:.2f}%", help="Average percentage the prediction was off.")
+col2.metric("Mean Absolute Error (MAE)", f"${mae:.2f}", help="Average dollar amount the prediction was off over the last 6 years.")
+col3.metric("MAPE (Percentage Error)", f"{mape:.2f}%", help="Average percentage the prediction was off over the last 6 years.")
 
 st.divider()
 
@@ -182,7 +182,6 @@ st.divider()
 st.subheader(f"🔍 {selected_stock} Forecast Components")
 st.markdown("Breakdown of the overall trajectory and recurring seasonal patterns discovered by the model.")
 
-# Generate the component charts using Prophet's built-in Plotly integration
 fig_comp = plot_components_plotly(m, forecast)
 st.plotly_chart(fig_comp, use_container_width=True)
 
