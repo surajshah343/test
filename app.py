@@ -2,6 +2,7 @@ import streamlit as st
 from datetime import date
 import yfinance as yf
 from prophet import Prophet
+from prophet.plot import plot_components_plotly # NEW IMPORT FOR COMPONENT GRAPHS
 from plotly.subplots import make_subplots
 from plotly import graph_objs as go
 import pandas as pd
@@ -111,21 +112,18 @@ forecast = m.predict(future)
 # -----------------------------------------------------------------------------
 # CALCULATE ACCURACY METRICS ON TEST DATA
 # -----------------------------------------------------------------------------
-# Align the test actuals with the model's predictions for those specific dates
 eval_df = test_data.merge(forecast[['ds', 'yhat']], on='ds', how='inner')
 
-# Calculate Errors
 mae = np.mean(np.abs(eval_df['y'] - eval_df['yhat']))
 mape = np.mean(np.abs((eval_df['y'] - eval_df['yhat']) / eval_df['y'])) * 100
 
-# Display Metrics in the UI
 st.subheader("Model Accuracy (Against Last 365 Days Held-Out Data)")
 col1, col2, col3 = st.columns(3)
 current_price = data['Close'].iloc[-1]
 
 col1.metric("Current Known Price", f"${current_price:.2f}")
-col2.metric("Mean Absolute Error (MAE)", f"${mae:.2f}", help="Average dollar amount the prediction was off during the test period.")
-col3.metric("MAPE (Percentage Error)", f"{mape:.2f}%", help="Average percentage the prediction was off during the test period.")
+col2.metric("Mean Absolute Error (MAE)", f"${mae:.2f}", help="Average dollar amount the prediction was off.")
+col3.metric("MAPE (Percentage Error)", f"{mape:.2f}%", help="Average percentage the prediction was off.")
 
 st.divider()
 
@@ -147,22 +145,12 @@ fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Prophet Pre
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(width=0), showlegend=False), row=1, col=1)
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'), row=1, col=1)
 
-# --- THE BUG FIX: Separate the line and the annotation ---
+# Plotly Bug Fix Annotation
 split_date = train_data['ds'].iloc[-1]
-
-# 1. Add just the line (no text)
 fig.add_vline(x=split_date, line_dash="dash", line_color="gray", row=1, col=1)
-
-# 2. Add the text manually using a direct annotation
 fig.add_annotation(
-    x=split_date, 
-    y=1.05,            # Positions text slightly above the top of the chart
-    yref="paper",      # Uses relative positioning so it doesn't get messed up by stock prices
-    text="Train/Test Split",
-    showarrow=False,
-    font=dict(color="gray"),
-    xanchor="left",    # Aligns the text to start right after the line
-    row=1, col=1
+    x=split_date, y=1.05, yref="paper", text="Train/Test Split",
+    showarrow=False, font=dict(color="gray"), xanchor="left", row=1, col=1
 )
 
 # --- ROW 2: BOLLINGER BANDS ---
@@ -181,15 +169,22 @@ fig.add_trace(go.Scatter(x=data['Date'], y=data['Signal_Line'], name='Signal', l
 colors = ['green' if val >= 0 else 'red' for val in (data['MACD'] - data['Signal_Line'])]
 fig.add_trace(go.Bar(x=data['Date'], y=(data['MACD'] - data['Signal_Line']), name='Hist', marker_color=colors), row=4, col=1)
 
-# --- LAYOUT UPDATE ---
-fig.update_layout(
-    height=1200,
-    showlegend=True,
-    title_text="Unified Technical & Forecast Dashboard"
-)
+fig.update_layout(height=1200, showlegend=True, title_text="Unified Technical & Forecast Dashboard")
 fig.update_xaxes(rangeslider_visible=False)
 
 st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# -----------------------------------------------------------------------------
+# FORECAST COMPONENTS (TREND, WEEKLY, YEARLY)
+# -----------------------------------------------------------------------------
+st.subheader(f"🔍 {selected_stock} Forecast Components")
+st.markdown("Breakdown of the overall trajectory and recurring seasonal patterns discovered by the model.")
+
+# Generate the component charts using Prophet's built-in Plotly integration
+fig_comp = plot_components_plotly(m, forecast)
+st.plotly_chart(fig_comp, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # RAW DATA TAB
