@@ -15,6 +15,9 @@ import itertools
 START = "2000-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 
+# Dynamic Cap Multiplier (2.0 = Cap is 200% of historical All-Time High)
+CAP_MULTIPLIER = 2.0 
+
 st.set_page_config(page_title="Pro Stock Forecast App", layout="wide")
 st.title('📈 Auto-Optimized Stock Dashboard by S. Shah')
 
@@ -72,11 +75,10 @@ def calculate_technicals(df):
 data = calculate_technicals(data)
 
 # -----------------------------------------------------------------------------
-# ML OPTIMIZATION ENGINE (GRID SEARCH)
+# ML OPTIMIZATION ENGINE (LOGISTIC GROWTH + NO CACHING)
 # -----------------------------------------------------------------------------
 df_prophet = data[['Date','Close']].rename(columns={"Date": "ds", "Close": "y"})
 
-@st.cache_data(show_spinner=False)
 def optimize_prophet(df):
     cps_grid = [0.01, 0.05, 0.1, 0.2]
     sps_grid = [0.1, 1.0, 5.0, 10.0]
@@ -100,9 +102,14 @@ def optimize_prophet(df):
         train_data = df.iloc[:-test_days].copy()
         test_data = df.iloc[-test_days:].copy()
         
+        # LOGISTIC REQUIREMENT: Calculate dynamic cap and floor for training
+        historical_max = train_data['y'].max()
+        train_data['cap'] = historical_max * CAP_MULTIPLIER
+        train_data['floor'] = 0
+        
         try:
-            # THE FIX: Native multiplicative seasonality prevents exponential blowouts
             m = Prophet(
+                growth='logistic', # Switched from linear to logistic
                 changepoint_prior_scale=cps, 
                 seasonality_prior_scale=sps, 
                 seasonality_mode='multiplicative', 
@@ -112,6 +119,10 @@ def optimize_prophet(df):
             m.fit(train_data)
             
             future = m.make_future_dataframe(periods=test_days, freq='B')
+            # LOGISTIC REQUIREMENT: Apply same cap and floor to future dataframe
+            future['cap'] = historical_max * CAP_MULTIPLIER
+            future['floor'] = 0
+            
             forecast = m.predict(future)
             
             eval_df = test_data.merge(forecast[['ds', 'yhat']], on='ds', how='inner')
@@ -142,15 +153,20 @@ st.sidebar.info(f"""
 """)
 
 # -----------------------------------------------------------------------------
-# FORECASTING LOGIC (MULTIPLICATIVE FIX)
+# FORECASTING LOGIC (LOGISTIC + MULTIPLICATIVE)
 # -----------------------------------------------------------------------------
 test_days = test_years * 252
 
 train_data = df_prophet.iloc[:-test_days].copy()
 test_data = df_prophet.iloc[-test_days:].copy()
 
-# THE FIX: Applied to the final model rendering
+# Final Model Dynamic Cap
+final_historical_max = train_data['y'].max()
+train_data['cap'] = final_historical_max * CAP_MULTIPLIER
+train_data['floor'] = 0
+
 m = Prophet(
+    growth='logistic',
     changepoint_prior_scale=cps, 
     seasonality_prior_scale=sps,
     seasonality_mode='multiplicative'
@@ -160,6 +176,9 @@ m.fit(train_data)
 
 total_periods = test_days + period
 future = m.make_future_dataframe(periods=total_periods, freq='B')
+future['cap'] = final_historical_max * CAP_MULTIPLIER
+future['floor'] = 0
+
 forecast = m.predict(future)
 
 # -----------------------------------------------------------------------------
@@ -209,6 +228,9 @@ fig.add_trace(go.Scatter(x=test_data['ds'], y=test_data['y'], name='Test Data (A
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name='Prophet Prediction', mode='lines', line=dict(color='blue')), row=1, col=1)
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], mode='lines', line=dict(width=0), showlegend=False), row=1, col=1)
 fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'), row=1, col=1)
+
+# Visualize the invisible "Cap" ceiling on the chart
+fig.add_hline(y=final_historical_max * CAP_MULTIPLIER, line_dash="dash", line_color="red", opacity=0.3, annotation_text="Mathematical Cap", row=1, col=1)
 
 split_date = train_data['ds'].iloc[-1]
 fig.add_vline(x=split_date, line_dash="dash", line_color="gray", row=1, col=1)
