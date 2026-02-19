@@ -1,4 +1,5 @@
 import streamlit as st
+import os
 from datetime import date
 import yfinance as yf
 from plotly.subplots import make_subplots
@@ -11,11 +12,14 @@ import calendar
 # -----------------------------------------------------------------------------
 # SETUP & CONFIGURATION
 # -----------------------------------------------------------------------------
-START = "1990-01-01" 
+START = "1995-01-01" 
 TODAY = date.today().strftime("%Y-%m-%d")
 
+# Create a directory to store the "brain" of our models
+os.makedirs("saved_models", exist_ok=True)
+
 st.set_page_config(page_title="Pro Dashboard", layout="wide")
-st.title('🌳 Auto-Optimized Technical Dashboard by S. Shah')
+st.title('🧠 Continuous Learning AI Dashboard by S. Shah')
 
 # -----------------------------------------------------------------------------
 # SIDEBAR (CONFIGURATION)
@@ -26,6 +30,8 @@ selected_stock = ticker_input.upper()
 
 n_years = st.sidebar.slider('Future Forecast Horizon (Years):', 1, 4, value=1)
 forecast_days = n_years * 252 
+
+MODEL_FILE = f"saved_models/{selected_stock}_continuous_model.json"
 
 # -----------------------------------------------------------------------------
 # DATA LOADING
@@ -61,16 +67,12 @@ if data is None or data.empty:
 # FEATURE ENGINEERING & TECHNICAL INDICATORS
 # -----------------------------------------------------------------------------
 def engineer_features(df):
-    """
-    Calculates technicals. Features must be mathematically stationary (percentages) 
-    so XGBoost can extrapolate future trends without hitting tree boundaries.
-    """
     df = df.copy()
     
     df['DayOfYear'] = df['Date'].dt.dayofyear
     df['Month'] = df['Date'].dt.month
     
-    # Standard Indicators (Used for plotting)
+    # Standard Indicators
     df['SMA_10'] = df['Close'].rolling(window=10).mean()
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['Std_Dev'] = df['Close'].rolling(window=20).std()
@@ -95,23 +97,60 @@ def engineer_features(df):
     df['SMA_20_Pct'] = df['SMA_20'] / df['Close'] - 1
     df['MACD_Pct'] = df['MACD'] / df['Close']
     
+    # Rolling Volatility (Helps AI understand market chaos)
+    df['Vol_20'] = df['Lag_1_Ret'].rolling(window=20).std()
+    
     df['Daily_Return'] = df['Close'].pct_change()
     df['Target_Return'] = df['Daily_Return'].shift(-1)
     
     return df
 
 all_data_engineered = engineer_features(data)
-
-features = ['Lag_1_Ret', 'Lag_2_Ret', 'SMA_10_Pct', 'SMA_20_Pct', 'MACD_Pct', 'RSI', 'DayOfYear', 'Month']
+features = ['Lag_1_Ret', 'Lag_2_Ret', 'SMA_10_Pct', 'SMA_20_Pct', 'MACD_Pct', 'RSI', 'Vol_20', 'DayOfYear', 'Month']
 target = 'Target_Return'
 
 full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 
 # -----------------------------------------------------------------------------
+# CONTINUOUS LEARNING ENGINE (Self-Correction Logic)
+# -----------------------------------------------------------------------------
+final_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
+is_new_model = not os.path.exists(MODEL_FILE)
+
+if is_new_model:
+    st.sidebar.warning("⚠️ No saved brain found. Training baseline model from scratch...")
+    with st.spinner("Compiling initial AI brain..."):
+        # Train on everything we have
+        final_model.fit(full_ml_data[features], full_ml_data[target])
+        final_model.save_model(MODEL_FILE)
+        st.sidebar.success("✅ Baseline Brain Saved!")
+else:
+    # Load the existing model
+    final_model.load_model(MODEL_FILE)
+    st.sidebar.success("✅ Existing AI Brain Loaded!")
+    
+    # --- The Self-Correction Mechanism ---
+    # In a production environment, you would log the exact date the model was last updated.
+    # For this dashboard, we will simulate the daily update by grabbing the most recent 5 days
+    # of data and using XGBoost's incremental update feature to correct its recent mistakes.
+    
+    recent_unseen_data = full_ml_data.tail(5) 
+    
+    with st.spinner("Reviewing recent mistakes and updating neural pathways..."):
+        # The 'xgb_model' parameter tells XGBoost to add new trees to correct the residuals 
+        # of the loaded model, rather than starting from scratch.
+        final_model.fit(
+            recent_unseen_data[features], 
+            recent_unseen_data[target], 
+            xgb_model=MODEL_FILE # This is the crucial incremental learning step
+        )
+        final_model.save_model(MODEL_FILE)
+        st.sidebar.info("🧠 Brain updated with recent market behavior.")
+
+# -----------------------------------------------------------------------------
 # AUTOREGRESSIVE FORECAST FUNCTION
 # -----------------------------------------------------------------------------
 def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predict):
-    """Simulates future days iteratively, maintaining a 300-day buffer for EMA stability."""
     buffer = start_buffer.copy()
     predictions = []
     
@@ -126,6 +165,7 @@ def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predi
             'SMA_20_Pct': [last_row['SMA_20_Pct']],
             'MACD_Pct': [last_row['MACD_Pct']],
             'RSI': [last_row['RSI']],
+            'Vol_20': [last_row['Vol_20']],
             'DayOfYear': [date_val.dayofyear],
             'Month': [date_val.month]
         })
@@ -141,144 +181,51 @@ def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predi
     return pd.DataFrame(predictions)
 
 # -----------------------------------------------------------------------------
-# ML OPTIMIZATION ENGINE (CACHED)
+# FUTURE FORECAST GENERATION
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def optimize_xgboost_horizon(ticker, ml_df, raw_df):
-    """Grid searches for the optimal test window length. Cached per ticker to speed up UI."""
-    test_years_grid = [1, 2, 3, 4]
-    best_mape = float('inf')
-    best_ty = 1
-    best_test_forecast = None
-    
-    total_days = len(ml_df)
-    
-    for ty in test_years_grid:
-        test_days_iter = ty * 252
-        if total_days <= test_days_iter + 252:
-            continue
-            
-        train_iter = ml_df.iloc[:-test_days_iter].copy()
-        test_iter = ml_df.iloc[-test_days_iter:].copy()
-        
-        model_iter = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
-        model_iter.fit(train_iter[features], train_iter[target])
-        
-        split_date = train_iter['Date'].iloc[-1]
-        start_buffer = raw_df[raw_df['Date'] <= split_date][['Date', 'Close']].tail(300).copy()
-        test_dates = test_iter['Date'].tolist()
-        
-        forecast_iter = generate_autoregressive_forecast(model_iter, start_buffer, test_dates)
-        
-        eval_df = test_iter[['Date', 'Close']].merge(forecast_iter[['Date', 'Close']], on='Date', suffixes=('_Actual', '_Pred'))
-        mape_iter = np.mean(np.abs((eval_df['Close_Actual'] - eval_df['Close_Pred']) / eval_df['Close_Actual'])) * 100
-        
-        if mape_iter < best_mape:
-            best_mape = mape_iter
-            best_ty = ty
-            best_test_forecast = forecast_iter
-            
-    return best_ty, best_mape, best_test_forecast
-
-with st.spinner("Running Grid Search to find optimal Test Horizon (Cached)..."):
-    optimal_test_years, final_mape, test_forecast = optimize_xgboost_horizon(selected_stock, full_ml_data, data)
-
-st.sidebar.divider()
-st.sidebar.subheader("🤖 Auto-ML Tuning Active")
-st.sidebar.info(f"""
-**Optimal Test Horizon:** {optimal_test_years} Years  
-**Minimized MAPE:** {final_mape:.2f}%
-""")
-
-# -----------------------------------------------------------------------------
-# FINAL MODEL TRAINING & FUTURE FORECAST
-# -----------------------------------------------------------------------------
-test_days = optimal_test_years * 252
-train_data = full_ml_data.iloc[:-test_days].copy()
-test_data = full_ml_data.iloc[-test_days:].copy()
-
-final_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
-
-with st.spinner("Training Final Model and Generating Future Forecast..."):
-    final_model.fit(train_data[features], train_data[target])
-    
-    # -------------------------------------------------------------------------
-    # FEATURE IMPORTANCE VISUALIZATION (SIDEBAR)
-    # -------------------------------------------------------------------------
-    importances = final_model.feature_importances_
-    importance_df = pd.DataFrame({'Feature': features, 'Importance': importances})
-    importance_df = importance_df.sort_values(by='Importance', ascending=True)
-
-    fig_imp = go.Figure(go.Bar(
-        x=importance_df['Importance'],
-        y=importance_df['Feature'],
-        orientation='h',
-        marker_color='teal',
-        opacity=0.8
-    ))
-    fig_imp.update_layout(
-        title="Model Feature Importance",
-        title_font_size=14,
-        margin=dict(l=0, r=0, t=30, b=0),
-        height=250,
-        xaxis_title="Relative Importance Weight",
-        yaxis_title=None,
-        plot_bgcolor='white',
-        paper_bgcolor='white'
-    )
-    fig_imp.update_xaxes(showgrid=True, gridcolor='rgba(230,230,230,0.5)')
-    
-    st.sidebar.divider()
-    st.sidebar.plotly_chart(fig_imp, use_container_width=True, config={'displayModeBar': False})
-    
-    # Generate the actual forecast
+with st.spinner("Generating Future Forecast..."):
     future_start_buffer = data[['Date', 'Close']].tail(300).copy()
     last_actual_date = future_start_buffer['Date'].iloc[-1]
     
     future_dates = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=forecast_days, freq='B')
     future_forecast = generate_autoregressive_forecast(final_model, future_start_buffer, future_dates)
 
-all_forecasts = pd.concat([test_forecast, future_forecast], ignore_index=True)
-combined_price_data = pd.concat([train_data[['Date', 'Close']], all_forecasts[['Date', 'Close']]], ignore_index=True)
-plot_data = engineer_features(combined_price_data)
+# Generate smooth plotting data
+plot_buffer = pd.concat([data[['Date', 'Close']], future_forecast[['Date', 'Close']]], ignore_index=True)
+plot_data = engineer_features(plot_buffer)
 
-# -----------------------------------------------------------------------------
-# SEASONALITY ANALYSIS 
-# -----------------------------------------------------------------------------
-st.subheader("🗓️ Historical Seasonality Analysis")
-st.markdown("Average performance historically grouped by the day of the week and month of the year.")
+# -------------------------------------------------------------------------
+# FEATURE IMPORTANCE VISUALIZATION (SIDEBAR)
+# -------------------------------------------------------------------------
+importances = final_model.feature_importances_
+importance_df = pd.DataFrame({'Feature': features, 'Importance': importances})
+importance_df = importance_df.sort_values(by='Importance', ascending=True)
 
-seas_df = data.copy()
-seas_df['Daily_Return'] = seas_df['Close'].pct_change() * 100
-seas_df['DayOfWeek'] = seas_df['Date'].dt.day_name()
-seas_df['Month'] = seas_df['Date'].dt.month_name()
-
-day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-day_stats = seas_df.groupby('DayOfWeek')['Daily_Return'].mean().reindex(day_order).fillna(0)
-day_colors = ['green' if val >= 0 else 'red' for val in day_stats]
-
-month_order = list(calendar.month_name)[1:]
-month_stats = seas_df.groupby('Month')['Daily_Return'].mean().reindex(month_order).fillna(0)
-month_colors = ['green' if val >= 0 else 'red' for val in month_stats]
-
-col_s1, col_s2 = st.columns(2)
-
-with col_s1:
-    fig_day = go.Figure(data=[go.Bar(x=day_stats.index, y=day_stats.values, marker_color=day_colors)])
-    fig_day.update_layout(title="Average Return by Day of Week (%)", height=300, margin=dict(l=0, r=0, t=40, b=0))
-    st.plotly_chart(fig_day, use_container_width=True)
-
-with col_s2:
-    fig_month = go.Figure(data=[go.Bar(x=month_stats.index, y=month_stats.values, marker_color=month_colors)])
-    fig_month.update_layout(title="Average Return by Month (%)", height=300, margin=dict(l=0, r=0, t=40, b=0))
-    st.plotly_chart(fig_month, use_container_width=True)
-
-st.divider()
+fig_imp = go.Figure(go.Bar(
+    x=importance_df['Importance'],
+    y=importance_df['Feature'],
+    orientation='h',
+    marker_color='teal',
+    opacity=0.8
+))
+fig_imp.update_layout(
+    title="Model's Current Feature Weights",
+    title_font_size=14,
+    margin=dict(l=0, r=0, t=30, b=0),
+    height=250,
+    xaxis_title="Relative Importance Weight",
+    yaxis_title=None,
+    plot_bgcolor='white',
+    paper_bgcolor='white'
+)
+fig_imp.update_xaxes(showgrid=True, gridcolor='rgba(230,230,230,0.5)')
+st.sidebar.divider()
+st.sidebar.plotly_chart(fig_imp, use_container_width=True, config={'displayModeBar': False})
 
 # -----------------------------------------------------------------------------
 # MASTER DASHBOARD VISUALIZATION
 # -----------------------------------------------------------------------------
-st.subheader("📈 Unified Technical & Forecast Dashboard")
+st.subheader("📈 AI Unified Technical & Forecast Dashboard")
 
 with st.container():
     fig = make_subplots(
@@ -286,7 +233,7 @@ with st.container():
         shared_xaxes=True, 
         vertical_spacing=0.04, 
         subplot_titles=(
-            f'{selected_stock} XGBoost Forecast & Price', 
+            f'{selected_stock} AI Forecast & Price', 
             'Bollinger Bands', 
             'RSI', 
             'MACD'
@@ -294,14 +241,8 @@ with st.container():
         row_heights=[0.5, 0.15, 0.15, 0.2] 
     )
 
-    fig.add_trace(go.Scatter(x=train_data['Date'], y=train_data['Close'], name='Train Data', mode='lines', line=dict(color='black', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=test_data['Date'], y=test_data['Close'], name='Test Data (Actual)', mode='lines', line=dict(color='rgba(0,0,0,0.3)', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=test_forecast['Date'], y=test_forecast['Close'], name='Test Forecast (Simulated)', mode='lines', line=dict(color='orange', dash='dot', width=2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='Future Forecast', mode='lines', line=dict(color='blue', width=2)), row=1, col=1)
-
-    split_date = train_data['Date'].iloc[-1]
-    fig.add_vline(x=split_date, line_dash="dash", line_color="gray", row=1, col=1)
-    fig.add_annotation(x=split_date, y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="gray", size=10), xanchor="left", row=1, col=1)
+    fig.add_trace(go.Scatter(x=data['Date'], y=data['Close'], name='Historical Data', mode='lines', line=dict(color='black', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=future_forecast['Date'], y=future_forecast['Close'], name='AI Future Forecast', mode='lines', line=dict(color='blue', width=2)), row=1, col=1)
 
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
     fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
@@ -339,17 +280,21 @@ with st.container():
         paper_bgcolor='white'
     )
     
-    fig.update_xaxes(
-        rangeslider_visible=False, 
-        showgrid=True, 
-        gridwidth=1, 
-        gridcolor='rgba(230,230,230,0.5)'
-    )
-    fig.update_yaxes(
-        showgrid=True, 
-        gridwidth=1, 
-        gridcolor='rgba(230,230,230,0.5)',
-        zeroline=False 
-    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(230,230,230,0.5)', zeroline=False)
 
     st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+# -----------------------------------------------------------------------------
+# CSV EXPORT
+# -----------------------------------------------------------------------------
+#st.divider()
+#st.subheader("📥 Export AI Forecast Data")
+
+#csv = future_forecast.to_csv(index=False).encode('utf-8')
+#st.download_button(
+#    label="Download Future Forecast as CSV",
+#    data=csv,
+#    file_name=f"{selected_stock}_AI_Forecast.csv",
+#    mime="text/csv",
+#)
