@@ -302,5 +302,9 @@ for r in range(1, 5):
     fig.add_annotation(x=0.01, y=0.9, xref=f"x{r if r>1 else ''} domain", yref=f"y{r if r>1 else ''} domain", text="<b>?</b>", showarrow=False, 
                        bgcolor="gray", font=dict(color="white"), hovertext="Zoom to inspect specific regions. Use the ModeBar (top right) to pan or reset.")
 
-fig.update_layout(height=1000, template='white', hovermode='x unified', legend=dict(orientation="h", y=1.05))
-st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'scrollZoom': True})
+fig.update_layout(
+    height=1000, 
+    template='plotly_white',  # Fixed template name
+    hovermode='x unified', 
+    legend=dict(orientation="h", y=1.05)
+)
