@@ -60,17 +60,17 @@ if data is None or data.empty:
 # -----------------------------------------------------------------------------
 # FEATURE ENGINEERING & TECHNICAL INDICATORS
 # -----------------------------------------------------------------------------
-def engineer_features(df, drop_nans=False):
+def engineer_features(df):
     """
-    Calculates technicals. 
-    drop_nans=True is used for ML training so XGBoost doesn't crash.
-    drop_nans=False is used for Plotly so lines remain continuous on the chart.
+    Calculates technicals. Features must be mathematically stationary (percentages) 
+    so XGBoost can extrapolate future trends without hitting tree boundaries.
     """
     df = df.copy()
     
     df['DayOfYear'] = df['Date'].dt.dayofyear
     df['Month'] = df['Date'].dt.month
     
+    # Standard Indicators (Used for plotting)
     df['SMA_10'] = df['Close'].rolling(window=10).mean()
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['Std_Dev'] = df['Close'].rolling(window=20).std()
@@ -88,39 +88,47 @@ def engineer_features(df, drop_nans=False):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    df['Lag_1_Close'] = df['Close'].shift(1)
-    df['Lag_2_Close'] = df['Close'].shift(2)
+    # ML Features (Stationary/Relative)
+    df['Lag_1_Ret'] = df['Close'] / df['Close'].shift(1) - 1
+    df['Lag_2_Ret'] = df['Close'] / df['Close'].shift(2) - 1
+    df['SMA_10_Pct'] = df['SMA_10'] / df['Close'] - 1
+    df['SMA_20_Pct'] = df['SMA_20'] / df['Close'] - 1
+    df['MACD_Pct'] = df['MACD'] / df['Close']
+    
     df['Daily_Return'] = df['Close'].pct_change()
     df['Target_Return'] = df['Daily_Return'].shift(-1)
     
-    if drop_nans:
-        return df.dropna()
     return df
 
-full_ml_data = engineer_features(data, drop_nans=True)
-features = ['Lag_1_Close', 'Lag_2_Close', 'SMA_10', 'SMA_20', 'MACD', 'RSI', 'DayOfYear', 'Month']
+# Create raw dataset, then drop NaNs ONLY for the ML training set
+all_data_engineered = engineer_features(data)
+
+# Features are now strictly relative distances, not absolute prices
+features = ['Lag_1_Ret', 'Lag_2_Ret', 'SMA_10_Pct', 'SMA_20_Pct', 'MACD_Pct', 'RSI', 'DayOfYear', 'Month']
 target = 'Target_Return'
+
+# ML dataset safe for training (drops the final row where Target_Return is NaN)
+full_ml_data = all_data_engineered.dropna(subset=features + [target]).copy()
 
 # -----------------------------------------------------------------------------
 # AUTOREGRESSIVE FORECAST FUNCTION
 # -----------------------------------------------------------------------------
 def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predict):
-    """Simulates future days iteratively."""
+    """Simulates future days iteratively, maintaining a 300-day buffer for EMA stability."""
     buffer = start_buffer.copy()
     predictions = []
     
     for date_val in dates_to_predict:
-        # We don't drop NaNs here because the buffer might be short, 
-        # but the last row will have all valid features.
-        current_features_df = engineer_features(buffer, drop_nans=False) 
+        # Calculate features on the buffer. 
+        current_features_df = engineer_features(buffer) 
         last_row = current_features_df.iloc[-1]
         
         X_pred = pd.DataFrame({
-            'Lag_1_Close': [last_row['Lag_1_Close']],
-            'Lag_2_Close': [last_row['Lag_2_Close']],
-            'SMA_10': [last_row['SMA_10']],
-            'SMA_20': [last_row['SMA_20']],
-            'MACD': [last_row['MACD']],
+            'Lag_1_Ret': [last_row['Lag_1_Ret']],
+            'Lag_2_Ret': [last_row['Lag_2_Ret']],
+            'SMA_10_Pct': [last_row['SMA_10_Pct']],
+            'SMA_20_Pct': [last_row['SMA_20_Pct']],
+            'MACD_Pct': [last_row['MACD_Pct']],
             'RSI': [last_row['RSI']],
             'DayOfYear': [date_val.dayofyear],
             'Month': [date_val.month]
@@ -132,12 +140,13 @@ def generate_autoregressive_forecast(trained_model, start_buffer, dates_to_predi
         predictions.append({'Date': date_val, 'Close': new_close})
         
         new_row = pd.DataFrame({'Date': [date_val], 'Close': [new_close]})
-        buffer = pd.concat([buffer, new_row], ignore_index=True).tail(60) 
+        # Keep 300 days to ensure EMA mathematically converges and doesn't distort
+        buffer = pd.concat([buffer, new_row], ignore_index=True).tail(300) 
         
     return pd.DataFrame(predictions)
 
 # -----------------------------------------------------------------------------
-# ML OPTIMIZATION ENGINE (GRID SEARCH FOR OPTIMAL TEST YEARS)
+# ML OPTIMIZATION ENGINE
 # -----------------------------------------------------------------------------
 def optimize_xgboost_horizon():
     test_years_grid = [1, 2, 3, 4]
@@ -158,13 +167,13 @@ def optimize_xgboost_horizon():
         model_iter = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
         model_iter.fit(train_iter[features], train_iter[target])
         
-        start_buffer = train_iter[['Date', 'Close']].tail(60).copy()
+        # Pull raw price buffer exactly up to the split date
+        split_date = train_iter['Date'].iloc[-1]
+        start_buffer = data[data['Date'] <= split_date][['Date', 'Close']].tail(300).copy()
         test_dates = test_iter['Date'].tolist()
         
-        # Simulate the test period iteratively
         forecast_iter = generate_autoregressive_forecast(model_iter, start_buffer, test_dates)
         
-        # Evaluate
         eval_df = test_iter[['Date', 'Close']].merge(forecast_iter[['Date', 'Close']], on='Date', suffixes=('_Actual', '_Pred'))
         mape_iter = np.mean(np.abs((eval_df['Close_Actual'] - eval_df['Close_Pred']) / eval_df['Close_Actual'])) * 100
         
@@ -197,20 +206,24 @@ final_model = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5
 with st.spinner("Training Final Model and Generating Future Forecast..."):
     final_model.fit(train_data[features], train_data[target])
     
-    future_start_buffer = full_ml_data[['Date', 'Close']].tail(60).copy()
+    # Grab the true current day from raw data to seed the future forecast
+    future_start_buffer = data[['Date', 'Close']].tail(300).copy()
     last_actual_date = future_start_buffer['Date'].iloc[-1]
+    
+    # Now perfectly aligns to tomorrow
     future_dates = pd.date_range(start=last_actual_date + pd.Timedelta(days=1), periods=forecast_days, freq='B')
     
     future_forecast = generate_autoregressive_forecast(final_model, future_start_buffer, future_dates)
 
-# Generate smooth plotting data (drop_nans=False ensures lines connect across splits)
+# Generate smooth plotting data 
 all_forecasts = pd.concat([test_forecast, future_forecast], ignore_index=True)
 combined_price_data = pd.concat([train_data[['Date', 'Close']], all_forecasts[['Date', 'Close']]], ignore_index=True)
-plot_data = engineer_features(combined_price_data, drop_nans=False)
+plot_data = engineer_features(combined_price_data)
 
 # -----------------------------------------------------------------------------
-# SEASONALITY ANALYSIS (DAY OF WEEK & MONTH)
+# SEASONALITY ANALYSIS & DASHBOARD 
 # -----------------------------------------------------------------------------
+# (Visuals remain the same)
 st.subheader("🗓️ Historical Seasonality Analysis")
 st.markdown("Average performance historically grouped by the day of the week and month of the year.")
 
@@ -219,12 +232,10 @@ seas_df['Daily_Return'] = seas_df['Close'].pct_change() * 100
 seas_df['DayOfWeek'] = seas_df['Date'].dt.day_name()
 seas_df['Month'] = seas_df['Date'].dt.month_name()
 
-# Day of Week Data
 day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 day_stats = seas_df.groupby('DayOfWeek')['Daily_Return'].mean().reindex(day_order).fillna(0)
 day_colors = ['green' if val >= 0 else 'red' for val in day_stats]
 
-# Month Data
 month_order = list(calendar.month_name)[1:]
 month_stats = seas_df.groupby('Month')['Daily_Return'].mean().reindex(month_order).fillna(0)
 month_colors = ['green' if val >= 0 else 'red' for val in month_stats]
@@ -243,9 +254,6 @@ with col_s2:
 
 st.divider()
 
-# -----------------------------------------------------------------------------
-# MASTER DASHBOARD VISUALIZATION
-# -----------------------------------------------------------------------------
 st.subheader("📈 Unified Technical & Forecast Dashboard")
 
 fig = make_subplots(
@@ -256,7 +264,7 @@ fig = make_subplots(
     row_heights=[0.4, 0.2, 0.2, 0.2]
 )
 
-# --- ROW 1: PRICE & FORECAST ---
+# ROW 1: PRICE & FORECAST
 fig.add_trace(go.Scatter(x=train_data['Date'], y=train_data['Close'], name='Train Data', mode='lines', line=dict(color='black')), row=1, col=1)
 fig.add_trace(go.Scatter(x=test_data['Date'], y=test_data['Close'], name='Test Data (Actual)', mode='lines', line=dict(color='rgba(0,0,0,0.3)')), row=1, col=1)
 fig.add_trace(go.Scatter(x=test_forecast['Date'], y=test_forecast['Close'], name='Test Forecast (Simulated)', mode='lines', line=dict(color='orange', dash='dot')), row=1, col=1)
@@ -266,30 +274,27 @@ split_date = train_data['Date'].iloc[-1]
 fig.add_vline(x=split_date, line_dash="dash", line_color="gray", row=1, col=1)
 fig.add_annotation(x=split_date, y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="gray"), xanchor="left", row=1, col=1)
 
-# --- ROW 2: BOLLINGER BANDS ---
+# ROW 2: BOLLINGER BANDS
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Close'], name='Combined Price', line=dict(color='black', width=1), showlegend=False), row=2, col=1)
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Upper_Band'], name='Upper BB', line=dict(color='rgba(0,0,255,0.3)', width=1)), row=2, col=1)
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Lower_Band'], name='Lower BB', line=dict(color='rgba(0,0,255,0.3)', width=1), fill='tonexty', fillcolor='rgba(0,0,255,0.05)'), row=2, col=1)
 
-# --- ROW 3: RSI ---
+# ROW 3: RSI
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['RSI'], name='RSI', line=dict(color='purple')), row=3, col=1)
 fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
 fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
 
-# --- ROW 4: MACD ---
+# ROW 4: MACD
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['MACD'], name='MACD', line=dict(color='blue')), row=4, col=1)
 fig.add_trace(go.Scatter(x=plot_data['Date'], y=plot_data['Signal_Line'], name='Signal', line=dict(color='red')), row=4, col=1)
 
-# Bar chart for MACD Histogram
 macd_hist = plot_data['MACD'] - plot_data['Signal_Line']
 macd_colors = ['green' if val >= 0 else 'red' for val in macd_hist]
 fig.add_trace(go.Bar(x=plot_data['Date'], y=macd_hist, name='Hist', marker_color=macd_colors), row=4, col=1)
 
-# Add today line to all subplots
-fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=1, col=1)
-fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=2, col=1)
-fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=3, col=1)
-fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=4, col=1)
+# TODAY LINES
+for r in range(1, 5):
+    fig.add_vline(x=last_actual_date, line_dash="dot", line_color="green", row=r, col=1)
 fig.add_annotation(x=last_actual_date, y=1.05, yref="paper", text="Today", showarrow=False, font=dict(color="green"), xanchor="left", row=1, col=1)
 
 fig.update_layout(height=1200, showlegend=True)
