@@ -53,8 +53,9 @@ def load_data(ticker, start_date): # Add start_date here
         data.reset_index(inplace=True)
         if 'Date' not in data.columns and 'index' in data.columns: data.rename(columns={'index': 'Date'}, inplace=True)
         data.dropna(subset=['Close'], inplace=True)
-       return data
-    except Exception:
+        return data[['Date', 'Close']].copy()
+    except Exception as e:
+        st.error(f"Download Error: {e}")
         return None
 
 # When calling it:
