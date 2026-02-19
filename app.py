@@ -121,8 +121,8 @@ fig.add_trace(go.Scatter(
     x=forecast['ds'], y=forecast['yhat_lower'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.2)', name='Confidence'
 ), row=1, col=1)
 
-# Add a vertical line to visually mark where the training data ends and the testing/future begins
-split_date = train_data['ds'].iloc[-1]
+# THE FIX IS HERE: Convert the Pandas Timestamp to a string using strftime
+split_date = train_data['ds'].iloc[-1].strftime('%Y-%m-%d')
 fig.add_vline(x=split_date, line_dash="dash", line_color="gray", annotation_text="Train/Test Split", row=1, col=1)
 
 # --- ROW 2: BOLLINGER BANDS ---
