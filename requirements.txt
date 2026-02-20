@@ -1,10 +1,11 @@
+
 --extra-index-url https://download.pytorch.org/whl/cpu
-
-streamlit
-yfinance
-prophet
-plotly
-scikit-learn
-xgboost
 torch
-
+yfinance>=0.2.37
+pandas-datareader
+plotly
+pandas
+numpy
+xgboost
+scikit-learn
+requests
