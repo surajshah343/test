@@ -134,7 +134,7 @@ def run_simulation(_model, _historical_df, _n_days, _n_sims):
             'Vol_20': sigma,
             'DayOfYear': curr_date.dayofyear / 366.0,
             'Month': curr_date.month / 12.0
-        }])
+       
         
         alpha_pred = _model.predict(pred_feat)
         
