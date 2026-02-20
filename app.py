@@ -1,95 +1,176 @@
 import streamlit as st
+import os
+import time
+import requests
+import yfinance as yf
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
 from plotly import graph_objs as go
 from plotly.subplots import make_subplots
 
-# --- 1. ENHANCED DATA ENGINE ---
+# --- CONFIGURATION & SIDEBAR (Defined first to prevent NameError) ---
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+st.set_page_config(page_title="AI Quant Pro v14", layout="wide")
+
+st.sidebar.header("🕹️ Control Panel")
+ticker_input = st.sidebar.text_input("Ticker Symbol:", value="AMZN").upper()
+n_years = st.sidebar.slider('Forecast Horizon (Years):', 1, 3, value=1)
+seq_length = st.sidebar.slider('Lookback Window (Days):', 10, 60, value=30)
+train_button = st.sidebar.button("🚀 Run Analysis & AI Training")
+
+st.title(f"🧠 AI Financial Framework: {ticker_input}")
+
+# --- 1. MATHEMATICAL LOGIC & TECHNICAL INDICATORS ---
 @st.cache_data
-def get_technical_data(ticker):
-    df = yf.download(ticker, period="2y", interval="1d", progress=False)
+def get_advanced_data(ticker):
+    # Fetch 5 years of data for stable Fibonacci and MACD calculation
+    df = yf.download(ticker, period="5y", interval="1d", progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.reset_index()
-
-    # RSI (Relative Strength Index)
+    
+    # RSI: Standard Wilder's Smoothing logic
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # MACD (Moving Average Convergence Divergence)
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
+    df['RSI'] = 100 - (100 / (1 + (gain / loss)))
+    
+    # MACD: 12-26-9 Standard
+    df['EMA12'] = df['Close'].ewm(span=12, adjust=False).mean()
+    df['EMA26'] = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = df['EMA12'] - df['EMA26']
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
-
+    
     # Bollinger Bands
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['20STD'] = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = df['MA20'] + (df['20STD'] * 2)
     df['BB_Lower'] = df['MA20'] - (df['20STD'] * 2)
 
-    # Fibonacci Retracement (Based on 1-Year High/Low)
-    recent_period = df.tail(252)
-    max_p = recent_period['High'].max()
-    min_p = recent_period['Low'].min()
-    diff = max_p - min_p
-    df['Fib_0'] = max_p
-    df['Fib_236'] = max_p - 0.236 * diff
-    df['Fib_382'] = max_p - 0.382 * diff
-    df['Fib_500'] = max_p - 0.500 * diff
-    df['Fib_618'] = max_p - 0.618 * diff
-    df['Fib_100'] = min_p
+    # Fibonacci Retracement (Standard 52-week swing)
+    recent_yr = df.tail(252)
+    high, low = recent_yr['High'].max(), recent_yr['Low'].min()
+    diff = high - low
+    df['Fib_100'] = high
+    df['Fib_618'] = high - 0.382 * diff
+    df['Fib_500'] = high - 0.500 * diff
+    df['Fib_382'] = high - 0.618 * diff
+    df['Fib_0']   = low
 
-    return df.dropna()
+    # Target: Next day Log Return (Stationary Target)
+    df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['Vol_20'] = df['Log_Ret'].rolling(20).std()
+    df['Target'] = df['Log_Ret'].shift(-1)
+    
+    return df.dropna().reset_index(drop=True)
 
-# --- 2. INTERACTIVE DASHBOARD WITH TOOLTIPS ---
-df = get_technical_data(ticker_input)
-latest = df.iloc[-1]
+# --- 2. LSTM MODEL ARCHITECTURE ---
+class QuantLSTM(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, 64, 2, batch_first=True, dropout=0.1)
+        self.fc = nn.Linear(64, 1)
 
-st.subheader("📊 Key Technical Health Metrics")
-m1, m2, m3, m4 = st.columns(4)
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
 
-m1.metric("RSI (14D)", f"{latest['RSI']:.2f}", 
-          help="**Relative Strength Index:** Measures speed/change of price. \n- **>70:** Overbought (Possible reversal) \n- **<30:** Oversold (Possible buy)")
+# --- 3. EXECUTION LOGIC ---
+if ticker_input and train_button:
+    df = get_advanced_data(ticker_input)
+    latest = df.iloc[-1]
 
-m2.metric("MACD Hist", f"{latest['MACD_Hist']:.2f}",
-          help="**MACD Histogram:** Shows the gap between the MACD and Signal line. \n- **Positive/Growing:** Strong bullish momentum. \n- **Negative/Shrinking:** Weakening trend.")
+    # --- TOP METRIC ROW WITH TOOLTIPS ---
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("RSI (14D)", f"{latest['RSI']:.1f}", 
+              help="**Relative Strength Index**: Measures momentum. Over 70 is 'Overbought' (sell signal), under 30 is 'Oversold' (buy signal).")
+    m2.metric("MACD Hist", f"{latest['MACD_Hist']:.2f}", 
+              help="**MACD Histogram**: Shows the trend strength. Rising green bars suggest bullish acceleration; falling red bars suggest bearish momentum.")
+    m3.metric("BB Bandwidth", f"{(latest['BB_Upper'] - latest['BB_Lower']):.2f}", 
+              help="**Bollinger Bandwidth**: Measures volatility. A narrow band (The Squeeze) often precedes a massive price explosion.")
+    m4.metric("Fib 61.8% Level", f"${latest['Fib_618']:.2f}", 
+              help="**The Golden Ratio**: A key support level. If the price stays above this during a pullback, the bull trend is likely to continue.")
 
-m3.metric("BB Bandwidth", f"{(latest['BB_Upper'] - latest['BB_Lower']):.2f}",
-          help="**Bollinger Bandwidth:** Measures volatility. \n- **Narrowing:** 'The Squeeze' often precedes a major price breakout. \n- **Widening:** Increasing market volatility.")
+    # --- AI TRAINING (LEAKAGE-FREE) ---
+    features = ['Log_Ret', 'Vol_20', 'RSI', 'MACD_Hist']
+    split = int(len(df) * 0.8)
+    train_df, test_df = df.iloc[:split], df.iloc[split:]
+    
+    scaler_X = StandardScaler().fit(train_df[features])
+    scaler_y = StandardScaler().fit(train_df[['Target']])
 
-m4.metric("Price vs Fib 61.8%", f"{latest['Close']:.2f}", delta=f"{(latest['Close'] - latest['Fib_618']):.2f}",
-          help="**Fibonacci 61.8%:** The 'Golden Ratio' level. If the price holds above this during a dip, it indicates the long-term uptrend is still healthy.")
+    def prepare_seq(data, s_X, s_y):
+        X_sc = s_X.transform(data[features])
+        y_sc = s_y.transform(data[['Target']])
+        xs, ys = [], []
+        for i in range(len(X_sc) - seq_length):
+            xs.append(X_sc[i:(i + seq_length)])
+            ys.append(y_sc[i + seq_length])
+        return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
 
-# --- 3. ADVANCED CHARTING ---
-fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                    vertical_spacing=0.05, subplot_titles=('Price & BB/Fib', 'MACD', 'RSI'),
-                    row_width=[0.2, 0.2, 0.6])
+    X_train, y_train = prepare_seq(train_df, scaler_X, scaler_y)
+    model = QuantLSTM(len(features))
+    opt = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    with st.spinner("Training Neural Network..."):
+        for _ in range(30):
+            model.train()
+            opt.zero_grad()
+            loss = nn.MSELoss()(model(X_train), y_train)
+            loss.backward()
+            opt.step()
 
-# Price & Bollinger Bands
-fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name='Price', line=dict(color='black')), row=1, col=1)
-fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], name='BB Upper', line=dict(dash='dash', color='gray')), row=1, col=1)
-fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], name='BB Lower', line=dict(dash='dash', color='gray'), fill='tonexty'), row=1, col=1)
+    # --- RECURSIVE FORWARD FORECAST ---
+    forecast_days = int(n_years * 252)
+    last_seq = scaler_X.transform(df[features].tail(seq_length))
+    current_price = df['Close'].iloc[-1]
+    preds = []
+    
+    model.eval()
+    with torch.no_grad():
+        for _ in range(forecast_days):
+            inp = torch.FloatTensor(last_seq).unsqueeze(0)
+            ret_scaled = model(inp).item()
+            ret = scaler_y.inverse_transform([[ret_scaled]])[0][0]
+            
+            # Stochastic Drift
+            drifted_ret = ret + np.random.normal(0, df['Log_Ret'].std())
+            current_price *= np.exp(drifted_ret)
+            preds.append(current_price)
+            
+            # Update sequence for next day
+            new_feat = [drifted_ret, df['Log_Ret'].std(), 50.0, 0.0]
+            new_feat_sc = scaler_X.transform([new_feat])
+            last_seq = np.append(last_seq[1:], new_feat_sc, axis=0)
 
-# Fibonacci Levels (Static lines for latest trend)
-for lvl in ['Fib_0', 'Fib_236', 'Fib_382', 'Fib_500', 'Fib_618', 'Fib_100']:
-    fig.add_trace(go.Scatter(x=[df['Date'].iloc[-30], df['Date'].iloc[-1]], 
-                             y=[latest[lvl], latest[lvl]], 
-                             mode='lines', name=lvl, line=dict(width=1, dash='dot')), row=1, col=1)
+    # --- ADVANCED PLOTLY DASHBOARD ---
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                        subplot_titles=('Price & Technicals', 'MACD', 'RSI'), row_width=[0.2, 0.2, 0.6])
 
-# MACD Histogram
-colors = ['green' if x > 0 else 'red' for x in df['MACD_Hist']]
-fig.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], name='MACD Hist', marker_color=colors), row=2, col=1)
+    # Price, BB, and Forecast
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name='Historic Price', line=dict(color='blue')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], line=dict(color='rgba(173,216,230,0.5)', dash='dot'), name='BB Upper'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], line=dict(color='rgba(173,216,230,0.5)', dash='dot'), fill='tonexty', name='BB Lower'), row=1, col=1)
+    
+    f_dates = [df['Date'].iloc[-1] + timedelta(days=i) for i in range(1, forecast_days+1)]
+    fig.add_trace(go.Scatter(x=f_dates, y=preds, name='AI Forecast', line=dict(color='red', width=3)), row=1, col=1)
 
-# RSI
-fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], name='RSI', line=dict(color='purple')), row=3, col=1)
-fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+    # MACD
+    colors = ['green' if x > 0 else 'red' for x in df['MACD_Hist']]
+    fig.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], marker_color=colors, name='MACD Hist'), row=2, col=1)
 
-fig.update_layout(height=800, template="plotly_white", showlegend=False)
-st.plotly_chart(fig, use_container_width=True)
+    # RSI
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='purple'), name='RSI'), row=3, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+
+    fig.update_layout(height=900, template="plotly_white", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.info("👈 Enter a ticker and click 'Run Analysis' to generate the AI model.")
