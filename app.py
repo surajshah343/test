@@ -17,7 +17,7 @@ from sklearn.preprocessing import StandardScaler
 
 # --- CONFIGURATION ---
 os.makedirs("saved_models", exist_ok=True)
-st.set_page_config(page_title="AI Quant Pro v12.4 - Platinum Stability", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v12.5 - Final Cut", layout="wide")
 st.title('🧠 Financial AI: LSTM Deep Learning Framework & Backtester')
 
 # --- SIDEBAR & DIAGNOSTICS ---
@@ -36,12 +36,13 @@ st.sidebar.subheader("📡 Connection Diagnostics")
 api_status_text = st.sidebar.empty()
 
 # --- 1. MULTI-TIER RESILIENT DATA ACQUISITION ---
+# We KEEP caching here because downloading web data is slow
 @st.cache_data(show_spinner=False)
 def load_and_prep_data(ticker):
     df = pd.DataFrame()
     data_source = "None"
     
-    # Tier 1: yfinance (Front-End Scrape)
+    # Tier 1: yfinance
     try:
         session = requests.Session()
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
@@ -54,7 +55,7 @@ def load_and_prep_data(ticker):
         data_source = "Tier 1: yfinance"
         
     except Exception:
-        # Tier 2: yahooquery (Internal JSON API)
+        # Tier 2: yahooquery
         try:
             yq = YQTicker(ticker)
             df = yq.history(period="10y")
@@ -65,7 +66,7 @@ def load_and_prep_data(ticker):
             data_source = "Tier 2: yahooquery"
             
         except Exception:
-            # Tier 3: Stooq Direct CSV Fetch
+            # Tier 3: Stooq
             try:
                 stooq_url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
                 df = pd.read_csv(stooq_url)
@@ -76,21 +77,18 @@ def load_and_prep_data(ticker):
             except Exception:
                 return None, "All APIs Failed"
 
-    # Standardize 'Date' column name
     if 'Date' not in df.columns and 'date' in df.columns:
         df.rename(columns={'date': 'Date'}, inplace=True)
         
     if 'Date' not in df.columns:
         return None, "Corrupted Format"
 
-    # Force convert to UTC datetime, coerce unparseable text to NaT, then drop those invalid rows
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce', utc=True)
     df = df.dropna(subset=['Date'])
     
     if df.empty:
          return None, "All API text was unparseable"
         
-    # Ensure timezone awareness doesn't break Plotly by stripping the tz info safely
     df['Date'] = df['Date'].dt.tz_localize(None)
     
     # --- Feature Engineering ---
@@ -220,19 +218,18 @@ if should_train:
     model.eval()
 
 # --- 5. THE BACKTESTING ENGINE ---
-@st.cache_data(show_spinner=False)
-def run_backtest(_model, _X_test, _actual_returns, _scaler_y):
-    _model.eval()
+# CACHE REMOVED: Do not cache this function to prevent UnhashableParamError
+def run_backtest(live_model, test_features, act_returns, y_scaler):
+    live_model.eval()
     with torch.no_grad():
-        preds_scaled = _model(_X_test).numpy()
+        preds_scaled = live_model(test_features).numpy()
     
-    preds_raw = _scaler_y.inverse_transform(preds_scaled).flatten()
+    preds_raw = y_scaler.inverse_transform(preds_scaled).flatten()
     positions = np.where(preds_raw > 0, 1, -1)
     
-    # FIX: Cast the math back into a Pandas Series so .iloc and .cumprod work natively
-    strategy_returns = pd.Series(positions * _actual_returns.values)
+    strategy_returns = pd.Series(positions * act_returns.values)
     
-    cum_bh_returns = (1 + _actual_returns).cumprod() - 1
+    cum_bh_returns = (1 + act_returns).cumprod() - 1
     cum_strat_returns = (1 + strategy_returns).cumprod() - 1
     
     win_rate = np.mean(strategy_returns > 0) * 100
@@ -261,6 +258,7 @@ for i in range(100):
 bt_progress.empty()
 bt_status.empty()
 
+# Direct call to the un-cached function
 bh_curve, strat_curve, win_rate, strat_ret, bh_ret, positions, strat_daily_returns = run_backtest(model, X_test, actual_returns, scaler_y)
 
 # --- 6. UI & DASHBOARD ---
@@ -272,7 +270,6 @@ b1.metric("Buy & Hold Return", f"{bh_ret:.1f}%", help="Total return from simply 
 b2.metric("AI Strategy Return", f"{strat_ret:.1f}%", delta=f"{strat_ret - bh_ret:.1f}% vs B&H", help="Total return from the AI's daily Long/Short strategy.")
 b3.metric("AI Win Rate", f"{win_rate:.1f}%", help="The percentage of days the AI's position resulted in a profit.")
 
-# CSV EXPORT LOGIC
 trade_log_df = pd.DataFrame({
     'Date': backtest_dates,
     'AI_Signal': np.where(positions == 1, 'LONG', 'SHORT'),
@@ -308,29 +305,29 @@ fig_bt.update_layout(
 st.plotly_chart(fig_bt, use_container_width=True)
 
 # --- 7. STABILIZED FUTURE SIMULATION ---
-@st.cache_data(show_spinner=False)
-def run_lstm_simulation(_model, base_data, n_days, n_sims, _scaler_X, _scaler_y, _seq_length):
-    _model.eval()
+# CACHE REMOVED: Do not cache this function to prevent UnhashableParamError
+def run_lstm_simulation(live_model, base_data, num_days, num_sims, x_scaler, y_scaler, seq_len):
+    live_model.eval()
     last_price = base_data['Close'].iloc[-1]
     
     max_annual_drift = 0.25 
     daily_drift_cap = max_annual_drift / 252
 
-    last_seq = base_data[features].tail(_seq_length).values
-    last_seq_scaled = _scaler_X.transform(last_seq)
+    last_seq = base_data[features].tail(seq_len).values
+    last_seq_scaled = x_scaler.transform(last_seq)
     
-    all_paths = np.zeros((n_days, n_sims))
-    current_prices = np.full(n_sims, last_price)
+    all_paths = np.zeros((num_days, num_sims))
+    current_prices = np.full(num_sims, last_price)
     historical_vol = base_data['Log_Ret'].std()
     
     with torch.no_grad():
-        for d in range(n_days):
+        for d in range(num_days):
             seq_tensor = torch.FloatTensor(last_seq_scaled).unsqueeze(0)
-            pred_scaled = _model(seq_tensor).item()
-            pred_ret = _scaler_y.inverse_transform([[pred_scaled]])[0][0]
+            pred_scaled = live_model(seq_tensor).item()
+            pred_ret = y_scaler.inverse_transform([[pred_scaled]])[0][0]
             
             pred_ret = np.clip(pred_ret, -daily_drift_cap, daily_drift_cap)
-            shocks = np.random.normal(0, historical_vol, n_sims)
+            shocks = np.random.normal(0, historical_vol, num_sims)
             daily_returns = pred_ret + shocks
             
             current_prices = current_prices * np.exp(daily_returns)
@@ -340,6 +337,7 @@ def run_lstm_simulation(_model, base_data, n_days, n_sims, _scaler_X, _scaler_y,
     return all_paths
 
 with st.spinner(f"Simulating {n_simulations} future paths for {n_years} years..."):
+    # Direct call to the un-cached function
     sim_results = run_lstm_simulation(model, df, forecast_days, n_simulations, scaler_X, scaler_y, seq_length)
 
 median_forecast = np.median(sim_results, axis=1)
