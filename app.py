@@ -1,7 +1,7 @@
 import streamlit as st
 import os
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import yfinance as yf
 from plotly import graph_objs as go
 from plotly.subplots import make_subplots
@@ -16,8 +16,8 @@ START = "2015-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 os.makedirs("saved_models", exist_ok=True)
 
-st.set_page_config(page_title="AI Quant Dashboard v3.3", layout="wide")
-st.title('🧠 Financial AI: Quantitative Intelligence')
+st.set_page_config(page_title="AI Quant Dashboard v3.4", layout="wide")
+st.title('🧠 Financial AI: Full-History Quantitative Framework')
 
 # --- SIDEBAR & TICKER STATE ---
 st.sidebar.header("Configuration")
@@ -46,21 +46,18 @@ def load_data(ticker, start_date):
             df.columns = df.columns.get_level_values(0)
         df.reset_index(inplace=True)
         
-        # Core Technicals
+        # Log Returns
         df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
         
-        # RSI
+        # RSI (14 Period)
         delta = df['Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
+        df['RSI'] = 100 - (100 / (1 + (gain / loss)))
         
         # MACD
-        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp1 - exp2
-        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['MACD'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
+        df['Signal'] = df['MACD'].ewm(span=9).mean()
         df['MACD_Hist'] = df['MACD'] - df['Signal']
         
         # Bollinger Bands
@@ -137,42 +134,44 @@ sim_results, avg_alpha = run_simulation(final_model, ml_data, forecast_days, n_s
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Ticker", ticker_input)
 c2.metric("Last Price", f"${ml_data['Close'].iloc[-1]:.2f}")
-
-# Sentiment Logic
 sentiment = "Bullish" if avg_alpha > 0.0001 else "Bearish" if avg_alpha < -0.0001 else "Neutral"
-color = "normal" if sentiment == "Neutral" else "inverse" if sentiment == "Bearish" else "normal"
-c3.metric("AI Sentiment", sentiment, f"{avg_alpha*100:.4f}% Alpha/Day", delta_color=color)
-c4.metric("RSI (14)", f"{ml_data['RSI'].iloc[-1]:.1f}")
+c3.metric("AI Sentiment", sentiment, f"{avg_alpha*100:.4f}% Alpha/Day")
+c4.metric("Data Range", "2015 - Present")
 
-# MAIN FORECAST CHART
+# MAIN FORECAST CHART (Full History Enabled)
 fig_main = go.Figure()
-fig_main.add_trace(go.Scatter(x=ml_data['Date'].tail(252), y=ml_data['Close'].tail(252), name='Historical', line=dict(color='black')))
+# Removed .tail() to show full history from 2015
+fig_main.add_trace(go.Scatter(x=ml_data['Date'], y=ml_data['Close'], name='Historical Price', line=dict(color='black', width=1.5)))
+
 future_dates = pd.date_range(ml_data['Date'].max(), periods=forecast_days+1, freq='B')[1:]
 fig_main.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 97.5, axis=1), line=dict(width=0), showlegend=False))
-fig_main.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 2.5, axis=1), line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 100, 255, 0.1)', name='95% CI'))
-fig_main.add_trace(go.Scatter(x=future_dates, y=np.median(sim_results, axis=1), name='AI Median Path', line=dict(color='blue', width=2)))
+fig_main.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 2.5, axis=1), line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 100, 255, 0.15)', name='95% Confidence Interval'))
+fig_main.add_trace(go.Scatter(x=future_dates, y=np.median(sim_results, axis=1), name='AI Median Forecast', line=dict(color='#007BFF', width=2.5)))
+
+fig_main.update_layout(title=f"{ticker_input} Long-Term Price Action & AI Forecast", xaxis_rangeslider_visible=True, template="plotly_white")
 st.plotly_chart(fig_main, use_container_width=True)
 
-# TECHNICAL INDICATORS
-st.subheader("🛠 Technical Analysis (Regime Metrics)")
+# TECHNICAL INDICATORS (Focus on last 500 days for clarity)
+st.subheader("🛠 Technical Regime Analysis (Last 500 Trading Days)")
+tech_view = ml_data.tail(500) # Balanced view: enough history to see trends, but not cluttered
 fig_tech = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25])
 
 # Bollinger Bands
-fig_tech.add_trace(go.Scatter(x=ml_data['Date'].tail(150), y=ml_data['Upper'].tail(150), line=dict(color='rgba(173, 216, 230, 0.5)'), name='Upper Band'), row=1, col=1)
-fig_tech.add_trace(go.Scatter(x=ml_data['Date'].tail(150), y=ml_data['Lower'].tail(150), line=dict(color='rgba(173, 216, 230, 0.5)'), fill='tonexty', name='Lower Band'), row=1, col=1)
-fig_tech.add_trace(go.Scatter(x=ml_data['Date'].tail(150), y=ml_data['Close'].tail(150), line=dict(color='black'), name='Close'), row=1, col=1)
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['Upper'], line=dict(color='rgba(173, 216, 230, 0.5)'), name='Upper Band'), row=1, col=1)
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['Lower'], line=dict(color='rgba(173, 216, 230, 0.5)'), fill='tonexty', name='Lower Band'), row=1, col=1)
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['Close'], line=dict(color='black'), name='Close'), row=1, col=1)
 
 # MACD
-colors = ['green' if x > 0 else 'red' for x in ml_data['MACD_Hist'].tail(150)]
-fig_tech.add_trace(go.Bar(x=ml_data['Date'].tail(150), y=ml_data['MACD_Hist'].tail(150), name='MACD Hist', marker_color=colors), row=2, col=1)
-fig_tech.add_trace(go.Scatter(x=ml_data['Date'].tail(150), y=ml_data['MACD'].tail(150), name='MACD', line=dict(color='blue')), row=2, col=1)
+colors = ['#26a69a' if x > 0 else '#ef5350' for x in tech_view['MACD_Hist']]
+fig_tech.add_trace(go.Bar(x=tech_view['Date'], y=tech_view['MACD_Hist'], name='MACD Hist', marker_color=colors), row=2, col=1)
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['MACD'], name='MACD', line=dict(color='#2196f3')), row=2, col=1)
 
 # RSI
-fig_tech.add_trace(go.Scatter(x=ml_data['Date'].tail(150), y=ml_data['RSI'].tail(150), name='RSI', line=dict(color='purple')), row=3, col=1)
-fig_tech.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-fig_tech.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['RSI'], name='RSI', line=dict(color='#9c27b0')), row=3, col=1)
+fig_tech.add_hline(y=70, line_dash="dash", line_color="#ef5350", row=3, col=1)
+fig_tech.add_hline(y=30, line_dash="dash", line_color="#26a69a", row=3, col=1)
 
-fig_tech.update_layout(height=800, showlegend=False, template="plotly_white")
+fig_tech.update_layout(height=700, showlegend=False, template="plotly_white")
 st.plotly_chart(fig_tech, use_container_width=True)
 
 # Horizons Table
