@@ -17,7 +17,7 @@ from sklearn.preprocessing import StandardScaler
 
 # --- CONFIGURATION ---
 os.makedirs("saved_models", exist_ok=True)
-st.set_page_config(page_title="AI Quant Pro v12.1 - Diagnostics", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v12.2 - Diagnostics & Stability", layout="wide")
 st.title('🧠 Financial AI: LSTM Deep Learning Framework & Backtester')
 
 # --- SIDEBAR & DIAGNOSTICS ---
@@ -65,7 +65,7 @@ def load_and_prep_data(ticker):
             data_source = "Tier 2: yahooquery"
             
         except Exception:
-            # Tier 3: Stooq Direct CSV Fetch (Bypassing pandas-datareader)
+            # Tier 3: Stooq Direct CSV Fetch
             try:
                 # Stooq format for US stocks generally requires .US suffix
                 stooq_url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
@@ -76,7 +76,6 @@ def load_and_prep_data(ticker):
                     stooq_url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
                     df = pd.read_csv(stooq_url)
                     
-                df['Date'] = pd.to_datetime(df['Date'])
                 data_source = "Tier 3: Stooq Backup"
             except Exception:
                 return None, "All APIs Failed"
@@ -84,6 +83,9 @@ def load_and_prep_data(ticker):
     # Standardize 'Date' column name if APIs return slightly different casing
     if 'Date' not in df.columns and 'date' in df.columns:
         df.rename(columns={'date': 'Date'}, inplace=True)
+        
+    # FIX: Force convert to datetime object before using .dt accessor
+    df['Date'] = pd.to_datetime(df['Date'])
         
     # Ensure timezone awareness doesn't break Plotly
     if df['Date'].dt.tz is not None:
