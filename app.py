@@ -14,8 +14,8 @@ START = "2015-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 os.makedirs("saved_models", exist_ok=True)
 
-st.set_page_config(page_title="AI Quant Pro v3.9", layout="wide")
-st.title('🧠 Financial AI: Quantitative Regime Intelligence')
+st.set_page_config(page_title="AI Quant Pro v4.0", layout="wide")
+st.title('🧠 Financial AI: Quantitative Risk & Regime Intelligence')
 
 # --- SIDEBAR ---
 st.sidebar.header("Configuration")
@@ -25,7 +25,8 @@ forecast_days = int(n_years * 252)
 n_simulations = st.sidebar.slider('Monte Carlo Paths:', 100, 1000, value=500)
 retrain_button = st.sidebar.button("🔄 Force Model Retrain")
 
-MODEL_FILE = f"saved_models/{ticker_input}_v3.json"
+# BUMPED VERSION TO v4 TO CLEAR STALE FEATURE CACHE
+MODEL_FILE = f"saved_models/{ticker_input}_v4.json"
 
 # --- 1. DATA LOADING ---
 @st.cache_data(ttl=3600)
@@ -52,6 +53,7 @@ def engineer_features(df):
     return df.dropna().copy()
 
 ml_data = engineer_features(data)
+# Locked in feature set for v4
 features = ['Lag_1_Ret', 'SMA_20_Pct', 'Vol_20', 'DayOfYear']
 target = 'Target_Residual'
 
@@ -74,8 +76,8 @@ test_preds = final_model.predict(test_set[features])
 hit_ratio = np.mean(np.sign(test_preds) == np.sign(test_set[target].values)) * 100
 importance = dict(zip(features, final_model.feature_importances_))
 
-# --- 5. REGIME SUMMARY LOGIC ---
-st.subheader("📝 AI Regime Summary")
+# --- 5. REGIME SUMMARY & VaR LOGIC ---
+st.subheader("📝 AI Regime & Risk Summary")
 top_feature = max(importance, key=importance.get)
 current_sentiment = "Bullish" if np.mean(test_preds[-10:]) > 0 else "Bearish"
 
@@ -100,21 +102,7 @@ with st.container(border=True):
         analysis += " confidence in this regime."
         st.write(analysis)
 
-# --- 6. UI METRICS ---
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Ticker", ticker_input)
-m2.metric("Backtest Hit Ratio", f"{hit_ratio:.1f}%", help="Accuracy of predicted direction on unseen data.")
-m3.metric("Primary Driver", top_feature, help="The feature that provided the most 'Gain' in reducing prediction error.")
-m4.metric("Current Price", f"${data['Close'].iloc[-1]:.2f}")
-
-# --- 7. FEATURE IMPORTANCE CHART ---
-st.subheader("📊 Feature Intelligence")
-importance_df = pd.DataFrame({'Feature': list(importance.keys()), 'Importance': list(importance.values())}).sort_values(by='Importance')
-fig_imp = go.Figure(go.Bar(x=importance_df['Importance'], y=importance_df['Feature'], orientation='h', marker_color='#2ecc71'))
-fig_imp.update_layout(template="plotly_white", height=300, margin=dict(l=20, r=20, t=10, b=10))
-st.plotly_chart(fig_imp, use_container_width=True)
-
-# --- 8. SIMULATION & PROJECTION ---
+# --- 6. SIMULATION (Moved up to calculate VaR for metrics) ---
 @st.cache_data(show_spinner="Simulating Future Paths...")
 def run_simulation(_model, _historical_df, n_days, n_sims, ticker):
     last_price = _historical_df['Close'].iloc[-1]
@@ -137,11 +125,32 @@ def run_simulation(_model, _historical_df, n_days, n_sims, ticker):
 
 sim_results = run_simulation(final_model, ml_data, forecast_days, n_simulations, ticker_input)
 
+# Calculate 95% Value at Risk (VaR) from simulation
+final_prices = sim_results[-1, :]
+initial_price = data['Close'].iloc[-1]
+var_95_price = np.percentile(final_prices, 5)
+var_95_pct = ((var_95_price - initial_price) / initial_price) * 100
+
+# --- 7. UI METRICS ---
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Current Price", f"${initial_price:.2f}")
+m2.metric("Backtest Hit Ratio", f"{hit_ratio:.1f}%", help="Accuracy of predicted direction on unseen data.")
+m3.metric("95% Horizon VaR", f"{var_95_pct:.1f}%", help=f"There is a 5% historical probability the asset drops below ${var_95_price:.2f} by the end of the forecast period.")
+m4.metric("Primary Driver", top_feature, help="The feature that provided the most 'Gain' in reducing prediction error.")
+
+# --- 8. FEATURE IMPORTANCE CHART ---
+st.subheader("📊 Feature Intelligence")
+importance_df = pd.DataFrame({'Feature': list(importance.keys()), 'Importance': list(importance.values())}).sort_values(by='Importance')
+fig_imp = go.Figure(go.Bar(x=importance_df['Importance'], y=importance_df['Feature'], orientation='h', marker_color='#2ecc71'))
+fig_imp.update_layout(template="plotly_white", height=300, margin=dict(l=20, r=20, t=10, b=10))
+st.plotly_chart(fig_imp, use_container_width=True)
+
+# --- 9. STOCHASTIC PROJECTION ---
 st.subheader(f"🔮 Stochastic Projection ({n_years}Y)")
 fig_future = go.Figure()
 fig_future.add_trace(go.Scatter(x=ml_data['Date'].tail(500), y=ml_data['Close'].tail(500), name='Recent History', line=dict(color='black')))
 future_dates = pd.date_range(ml_data['Date'].max(), periods=forecast_days + 1, freq='B')[1:]
 fig_future.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 97.5, axis=1), line=dict(width=0), showlegend=False))
-fig_future.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 2.5, axis=1), line=dict(width=0), fill='tonexty', fillcolor='rgba(46, 204, 113, 0.1)', name='95% CI'))
+fig_future.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 5, axis=1), line=dict(width=0), fill='tonexty', fillcolor='rgba(231, 76, 60, 0.2)', name='95% VaR Boundary'))
 fig_future.add_trace(go.Scatter(x=future_dates, y=np.median(sim_results, axis=1), name='AI Median Forecast', line=dict(color='#2ecc71', width=3)))
 st.plotly_chart(fig_future, use_container_width=True)
