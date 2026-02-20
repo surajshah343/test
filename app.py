@@ -17,7 +17,7 @@ from sklearn.preprocessing import StandardScaler
 
 # --- CONFIGURATION ---
 os.makedirs("saved_models", exist_ok=True)
-st.set_page_config(page_title="AI Quant Pro v12.3 - Platinum Stability", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v12.4 - Platinum Stability", layout="wide")
 st.title('🧠 Financial AI: LSTM Deep Learning Framework & Backtester')
 
 # --- SIDEBAR & DIAGNOSTICS ---
@@ -83,7 +83,6 @@ def load_and_prep_data(ticker):
     if 'Date' not in df.columns:
         return None, "Corrupted Format"
 
-    # FIX: The check_for_mixed_inputs Error bypass
     # Force convert to UTC datetime, coerce unparseable text to NaT, then drop those invalid rows
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce', utc=True)
     df = df.dropna(subset=['Date'])
@@ -229,7 +228,9 @@ def run_backtest(_model, _X_test, _actual_returns, _scaler_y):
     
     preds_raw = _scaler_y.inverse_transform(preds_scaled).flatten()
     positions = np.where(preds_raw > 0, 1, -1)
-    strategy_returns = positions * _actual_returns.values
+    
+    # FIX: Cast the math back into a Pandas Series so .iloc and .cumprod work natively
+    strategy_returns = pd.Series(positions * _actual_returns.values)
     
     cum_bh_returns = (1 + _actual_returns).cumprod() - 1
     cum_strat_returns = (1 + strategy_returns).cumprod() - 1
@@ -276,7 +277,7 @@ trade_log_df = pd.DataFrame({
     'Date': backtest_dates,
     'AI_Signal': np.where(positions == 1, 'LONG', 'SHORT'),
     'Market_Return_%': (actual_returns.values * 100).round(3),
-    'AI_Strategy_Return_%': (strat_daily_returns * 100).round(3)
+    'AI_Strategy_Return_%': (strat_daily_returns.values * 100).round(3)
 })
 csv_data = trade_log_df.to_csv(index=False).encode('utf-8')
 
