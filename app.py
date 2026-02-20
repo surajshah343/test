@@ -14,8 +14,8 @@ START = "2015-01-01"
 TODAY = date.today().strftime("%Y-%m-%d")
 os.makedirs("saved_models", exist_ok=True)
 
-st.set_page_config(page_title="AI Quant Pro v3.8", layout="wide")
-st.title('🧠 Financial AI: Predictive Validation & Feature Intelligence')
+st.set_page_config(page_title="AI Quant Pro v3.9", layout="wide")
+st.title('🧠 Financial AI: Quantitative Regime Intelligence')
 
 # --- SIDEBAR ---
 st.sidebar.header("Configuration")
@@ -45,7 +45,6 @@ if data is None: st.stop()
 # --- 2. ML PREPARATION ---
 def engineer_features(df):
     df = df.copy()
-    # Feature set
     df['Lag_1_Ret'] = df['Log_Ret'].shift(1)
     df['SMA_20_Pct'] = (df['MA20'] / df['Close']) - 1
     df['Target_Residual'] = df['Log_Ret'].shift(-1) - df['Log_Ret'].rolling(50).mean()
@@ -70,60 +69,52 @@ else:
     final_model = xgb.XGBRegressor()
     final_model.load_model(MODEL_FILE)
 
-# --- 4. ACCURACY & HIT RATIO ---
+# --- 4. ACCURACY & IMPORTANCE ---
 test_preds = final_model.predict(test_set[features])
-hits = np.sign(test_preds) == np.sign(test_set[target].values)
-hit_ratio = np.mean(hits) * 100
+hit_ratio = np.mean(np.sign(test_preds) == np.sign(test_set[target].values)) * 100
+importance = dict(zip(features, final_model.feature_importances_))
 
-# --- 5. UI: TOP LEVEL METRICS WITH HOVER INFO ---
+# --- 5. REGIME SUMMARY LOGIC ---
+st.subheader("📝 AI Regime Summary")
+top_feature = max(importance, key=importance.get)
+current_sentiment = "Bullish" if np.mean(test_preds[-10:]) > 0 else "Bearish"
+
+with st.container(border=True):
+    col_a, col_b = st.columns([1, 2])
+    
+    with col_a:
+        st.write(f"**Primary Driver:** {top_feature}")
+        st.write(f"**Short-term Bias:** {current_sentiment}")
+    
+    with col_b:
+        analysis = f"The model for **{ticker_input}** is currently heavily influenced by **{top_feature}**. "
+        if top_feature == 'Vol_20':
+            analysis += "This suggests a 'Volatility Regime' where price swings are the main predictor of future drift. "
+        elif top_feature == 'SMA_20_Pct':
+            analysis += "The AI is focused on 'Mean Reversion', watching how far the price deviates from its 20-day average. "
+        elif top_feature == 'DayOfYear':
+            analysis += "Historical seasonality is dominating, implying the stock is following its typical annual cycle. "
+        
+        analysis += f"With a directional hit ratio of **{hit_ratio:.1f}%**, the model shows "
+        analysis += "moderate" if hit_ratio < 53 else "high"
+        analysis += " confidence in this regime."
+        st.write(analysis)
+
+# --- 6. UI METRICS ---
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Ticker", ticker_input)
-m2.metric(
-    "Backtest Hit Ratio", 
-    f"{hit_ratio:.1f}%", 
-    help="Directional Accuracy: How often the AI correctly predicted if the stock would outperform or underperform its trend. Above 53% is considered strong for financial models."
-)
-m3.metric(
-    "Test MAE", 
-    f"{mean_absolute_error(test_set[target], test_preds):.5f}",
-    help="Mean Absolute Error: The average 'miss' of the AI in log-return terms. Smaller is better. It represents the noise the AI couldn't account for."
-)
-m4.metric(
-    "Current Price", 
-    f"${data['Close'].iloc[-1]:.2f}",
-    help="The most recent closing price from Yahoo Finance used as the 'starting line' for the simulation."
-)
+m2.metric("Backtest Hit Ratio", f"{hit_ratio:.1f}%", help="Accuracy of predicted direction on unseen data.")
+m3.metric("Primary Driver", top_feature, help="The feature that provided the most 'Gain' in reducing prediction error.")
+m4.metric("Current Price", f"${data['Close'].iloc[-1]:.2f}")
 
-# --- 6. VISUALIZATION: FEATURE IMPORTANCE ---
-st.subheader("📊 Feature Intelligence: What's Driving the Model?")
-# Get feature importance from XGBoost
-importance_scores = final_model.feature_importances_
-importance_df = pd.DataFrame({'Feature': features, 'Importance': importance_scores}).sort_values(by='Importance', ascending=True)
-
-fig_imp = go.Figure(go.Bar(
-    x=importance_df['Importance'],
-    y=importance_df['Feature'],
-    orientation='h',
-    marker_color='#3498db'
-))
-fig_imp.update_layout(
-    title="Relative Contribution to Prediction",
-    xaxis_title="Importance Score (Gain)",
-    template="plotly_white",
-    height=300,
-    margin=dict(l=20, r=20, t=40, b=20)
-)
+# --- 7. FEATURE IMPORTANCE CHART ---
+st.subheader("📊 Feature Intelligence")
+importance_df = pd.DataFrame({'Feature': list(importance.keys()), 'Importance': list(importance.values())}).sort_values(by='Importance')
+fig_imp = go.Figure(go.Bar(x=importance_df['Importance'], y=importance_df['Feature'], orientation='h', marker_color='#2ecc71'))
+fig_imp.update_layout(template="plotly_white", height=300, margin=dict(l=20, r=20, t=10, b=10))
 st.plotly_chart(fig_imp, use_container_width=True)
 
-with st.expander("📖 How to read Feature Importance"):
-    st.write("""
-    - **Lag_1_Ret**: Importance of yesterday's price movement. High scores suggest the stock is 'trendy' or 'mean-reverting'.
-    - **SMA_20_Pct**: Distance from the 20-day average. High scores mean the model is looking for 'overextended' prices.
-    - **Vol_20**: Recent 20-day volatility. High scores mean risk levels are a primary driver of future returns.
-    - **DayOfYear**: Seasonal patterns. High scores suggest the stock has strong historical monthly cycles (e.g., 'January Effect').
-    """)
-
-# --- 7. FUTURE SIMULATION ---
+# --- 8. SIMULATION & PROJECTION ---
 @st.cache_data(show_spinner="Simulating Future Paths...")
 def run_simulation(_model, _historical_df, n_days, n_sims, ticker):
     last_price = _historical_df['Close'].iloc[-1]
@@ -146,11 +137,11 @@ def run_simulation(_model, _historical_df, n_days, n_sims, ticker):
 
 sim_results = run_simulation(final_model, ml_data, forecast_days, n_simulations, ticker_input)
 
-st.subheader(f"🔮 AI-Driven Stochastic Projection ({n_years}Y)")
+st.subheader(f"🔮 Stochastic Projection ({n_years}Y)")
 fig_future = go.Figure()
 fig_future.add_trace(go.Scatter(x=ml_data['Date'].tail(500), y=ml_data['Close'].tail(500), name='Recent History', line=dict(color='black')))
 future_dates = pd.date_range(ml_data['Date'].max(), periods=forecast_days + 1, freq='B')[1:]
 fig_future.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 97.5, axis=1), line=dict(width=0), showlegend=False))
-fig_future.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 2.5, axis=1), line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 123, 255, 0.1)', name='95% CI'))
-fig_future.add_trace(go.Scatter(x=future_dates, y=np.median(sim_results, axis=1), name='AI Median Forecast', line=dict(color='#3498db', width=3)))
+fig_future.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 2.5, axis=1), line=dict(width=0), fill='tonexty', fillcolor='rgba(46, 204, 113, 0.1)', name='95% CI'))
+fig_future.add_trace(go.Scatter(x=future_dates, y=np.median(sim_results, axis=1), name='AI Median Forecast', line=dict(color='#2ecc71', width=3)))
 st.plotly_chart(fig_future, use_container_width=True)
