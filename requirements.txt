@@ -1,7 +1,7 @@
-
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 yfinance>=0.2.37
+yahooquery
 pandas-datareader
 plotly
 pandas
