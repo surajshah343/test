@@ -17,7 +17,7 @@ from sklearn.preprocessing import StandardScaler
 
 # --- CONFIGURATION ---
 os.makedirs("saved_models", exist_ok=True)
-st.set_page_config(page_title="AI Quant Pro v12.2 - Diagnostics & Stability", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v12.3 - Platinum Stability", layout="wide")
 st.title('🧠 Financial AI: LSTM Deep Learning Framework & Backtester')
 
 # --- SIDEBAR & DIAGNOSTICS ---
@@ -67,29 +67,32 @@ def load_and_prep_data(ticker):
         except Exception:
             # Tier 3: Stooq Direct CSV Fetch
             try:
-                # Stooq format for US stocks generally requires .US suffix
                 stooq_url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
                 df = pd.read_csv(stooq_url)
-                
-                # Fallback if it's not a US stock and the .US suffix fails
                 if df.empty or 'Date' not in df.columns:
                     stooq_url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
                     df = pd.read_csv(stooq_url)
-                    
                 data_source = "Tier 3: Stooq Backup"
             except Exception:
                 return None, "All APIs Failed"
 
-    # Standardize 'Date' column name if APIs return slightly different casing
+    # Standardize 'Date' column name
     if 'Date' not in df.columns and 'date' in df.columns:
         df.rename(columns={'date': 'Date'}, inplace=True)
         
-    # FIX: Force convert to datetime object before using .dt accessor
-    df['Date'] = pd.to_datetime(df['Date'])
+    if 'Date' not in df.columns:
+        return None, "Corrupted Format"
+
+    # FIX: The check_for_mixed_inputs Error bypass
+    # Force convert to UTC datetime, coerce unparseable text to NaT, then drop those invalid rows
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce', utc=True)
+    df = df.dropna(subset=['Date'])
+    
+    if df.empty:
+         return None, "All API text was unparseable"
         
-    # Ensure timezone awareness doesn't break Plotly
-    if df['Date'].dt.tz is not None:
-        df['Date'] = df['Date'].dt.tz_localize(None)
+    # Ensure timezone awareness doesn't break Plotly by stripping the tz info safely
+    df['Date'] = df['Date'].dt.tz_localize(None)
     
     # --- Feature Engineering ---
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
@@ -110,14 +113,14 @@ def load_and_prep_data(ticker):
     return df.dropna().copy(), data_source
 
 with st.spinner(f"Establishing multi-tier data link for {ticker_input}..."):
-    df, active_source = load_and_prep_data(ticker_input)
-
-if df is None:
-    api_status_text.error("❌ Disconnected")
-    st.error(f"Critical Failure: All 3 data pipelines blocked for {ticker_input}. The ticker may be invalid or servers are temporarily down.")
-    st.stop()
-else:
-    api_status_text.success(f"✅ Connected via {active_source}")
+    res = load_and_prep_data(ticker_input)
+    if res[0] is None:
+        api_status_text.error("❌ Disconnected")
+        st.error(f"Critical Failure: All 3 data pipelines blocked or corrupted for {ticker_input}. Status: {res[1]}")
+        st.stop()
+    else:
+        df, active_source = res
+        api_status_text.success(f"✅ Connected via {active_source}")
 
 # --- 2. LSTM MODEL DEFINITION ---
 class QuantLSTM(nn.Module):
@@ -235,7 +238,7 @@ def run_backtest(_model, _X_test, _actual_returns, _scaler_y):
     strat_total_ret = cum_strat_returns.iloc[-1] * 100
     bh_total_ret = cum_bh_returns.iloc[-1] * 100
     
-    return cum_bh_returns, cum_strat_returns, win_rate, strat_total_ret, bh_total_ret, positions
+    return cum_bh_returns, cum_strat_returns, win_rate, strat_total_ret, bh_total_ret, positions, strategy_returns
 
 st.markdown("### ⏳ Running Walk-Forward Backtest...")
 bt_progress = st.progress(0)
@@ -257,7 +260,7 @@ for i in range(100):
 bt_progress.empty()
 bt_status.empty()
 
-bh_curve, strat_curve, win_rate, strat_ret, bh_ret, positions = run_backtest(model, X_test, actual_returns, scaler_y)
+bh_curve, strat_curve, win_rate, strat_ret, bh_ret, positions, strat_daily_returns = run_backtest(model, X_test, actual_returns, scaler_y)
 
 # --- 6. UI & DASHBOARD ---
 st.markdown("---")
@@ -267,6 +270,23 @@ b1, b2, b3 = st.columns(3)
 b1.metric("Buy & Hold Return", f"{bh_ret:.1f}%", help="Total return from simply holding the asset for the last year.")
 b2.metric("AI Strategy Return", f"{strat_ret:.1f}%", delta=f"{strat_ret - bh_ret:.1f}% vs B&H", help="Total return from the AI's daily Long/Short strategy.")
 b3.metric("AI Win Rate", f"{win_rate:.1f}%", help="The percentage of days the AI's position resulted in a profit.")
+
+# CSV EXPORT LOGIC
+trade_log_df = pd.DataFrame({
+    'Date': backtest_dates,
+    'AI_Signal': np.where(positions == 1, 'LONG', 'SHORT'),
+    'Market_Return_%': (actual_returns.values * 100).round(3),
+    'AI_Strategy_Return_%': (strat_daily_returns * 100).round(3)
+})
+csv_data = trade_log_df.to_csv(index=False).encode('utf-8')
+
+st.download_button(
+    label="📥 Export 1-Year Trade Logs to CSV",
+    data=csv_data,
+    file_name=f"{ticker_input}_AI_Trade_Log.csv",
+    mime="text/csv",
+    help="Download the AI's exact daily trades and open them in Excel."
+)
 
 fig_bt = go.Figure()
 fig_bt.add_trace(go.Scatter(x=backtest_dates, y=bh_curve * 100, name='Buy & Hold (Benchmark)', line=dict(color='#95a5a6', width=2, dash='dot')))
