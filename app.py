@@ -154,4 +154,83 @@ m2.metric("Backtest Hit Ratio", f"{hit_ratio:.1f}%", help="Directional Accuracy:
 m3.metric("95% Horizon VaR", f"{var_95_pct:.1f}%", help=f"There is a 5% historical probability the asset drops below ${var_95_price:.2f} by the end of the forecast period.")
 m4.metric("Test MAE", f"{mean_absolute_error(test_set[target], test_preds):.5f}", help="Mean Absolute Error on the unseen test data.")
 
-# --- 6. MAIN CHART
+# --- 6. MAIN CHART: FULL HISTORY + TRAIN/TEST/FORECAST ---
+st.subheader(f"📈 Stochastic Projection & Data Provenance ({n_years}Y)")
+fig_main = go.Figure()
+
+# Train Data (Blue)
+fig_main.add_trace(go.Scatter(x=train_set['Date'], y=train_set['Close'], name='Training Data (Seen)', line=dict(color='#2980b9')))
+# Test Data (Orange)
+fig_main.add_trace(go.Scatter(x=test_set['Date'], y=test_set['Close'], name='Testing Data (Unseen)', line=dict(color='#e67e22')))
+
+# Future Projection
+future_dates = pd.date_range(ml_data['Date'].max(), periods=forecast_days + 1, freq='B')[1:]
+fig_main.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 97.5, axis=1), line=dict(width=0), showlegend=False))
+fig_main.add_trace(go.Scatter(x=future_dates, y=np.percentile(sim_results, 5, axis=1), line=dict(width=0), fill='tonexty', fillcolor='rgba(231, 76, 60, 0.15)', name='95% VaR Boundary'))
+fig_main.add_trace(go.Scatter(x=future_dates, y=np.median(sim_results, axis=1), name='AI Median Forecast', line=dict(color='#2ecc71', width=3)))
+
+# Split Point Annotation
+fig_main.add_shape(type="line", x0=train_set['Date'].iloc[-1], x1=train_set['Date'].iloc[-1], y0=0, y1=1, yref="paper", line=dict(color="Red", width=1, dash="dash"))
+fig_main.add_annotation(x=train_set['Date'].iloc[-1], y=1.05, yref="paper", text="Train/Test Split", showarrow=False, font=dict(color="red"))
+
+fig_main.update_layout(template="plotly_white", hovermode="x unified", xaxis_rangeslider_visible=True, height=600)
+st.plotly_chart(fig_main, use_container_width=True)
+
+
+# --- 7. TECHNICAL ANALYSIS SUBPLOTS ---
+st.subheader("🛠 Technical Regime Analysis (Last 500 Days)")
+tech_view = ml_data.tail(500)
+fig_tech = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25])
+
+# Bollinger Bands
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['Upper'], line=dict(color='rgba(173, 216, 230, 0.5)'), name='Upper Band'), row=1, col=1)
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['Lower'], line=dict(color='rgba(173, 216, 230, 0.5)'), fill='tonexty', name='Lower Band'), row=1, col=1)
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['Close'], line=dict(color='#2c3e50'), name='Close'), row=1, col=1)
+
+# MACD
+macd_colors = ['#26a69a' if x > 0 else '#ef5350' for x in tech_view['MACD_Hist']]
+fig_tech.add_trace(go.Bar(x=tech_view['Date'], y=tech_view['MACD_Hist'], name='MACD Hist', marker_color=macd_colors), row=2, col=1)
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['MACD'], name='MACD', line=dict(color='#2980b9')), row=2, col=1)
+
+# RSI
+fig_tech.add_trace(go.Scatter(x=tech_view['Date'], y=tech_view['RSI'], name='RSI', line=dict(color='#8e44ad')), row=3, col=1)
+fig_tech.add_hline(y=70, line_dash="dash", line_color="#ef5350", row=3, col=1)
+fig_tech.add_hline(y=30, line_dash="dash", line_color="#26a69a", row=3, col=1)
+
+fig_tech.update_layout(height=700, showlegend=False, template="plotly_white")
+st.plotly_chart(fig_tech, use_container_width=True)
+
+# --- 8. FEATURE INTELLIGENCE & SUMMARY ---
+st.markdown("---")
+st.subheader("🧠 Feature Intelligence & AI Logic")
+
+top_feature = max(importance, key=importance.get)
+current_sentiment = "Bullish" if np.mean(test_preds[-10:]) > 0 else "Bearish"
+
+col_chart, col_text = st.columns([1, 1])
+
+with col_chart:
+    importance_df = pd.DataFrame({'Feature': list(importance.keys()), 'Importance': list(importance.values())}).sort_values(by='Importance')
+    fig_imp = go.Figure(go.Bar(x=importance_df['Importance'], y=importance_df['Feature'], orientation='h', marker_color='#34495e'))
+    fig_imp.update_layout(title="Relative Feature Importance (Gain)", template="plotly_white", height=300, margin=dict(l=20, r=20, t=40, b=10))
+    st.plotly_chart(fig_imp, use_container_width=True)
+
+with col_text:
+    st.write("### AI Regime Summary")
+    st.write(f"**Current Directional Bias:** {current_sentiment}")
+    
+    analysis = f"The XGBoost model for **{ticker_input}** is currently heavily influenced by **{top_feature}**. "
+    if top_feature == 'Vol_20':
+        analysis += "This indicates a **Volatility Regime** where price swings and risk metrics are the primary predictors of future drift. "
+    elif top_feature == 'SMA_20_Pct':
+        analysis += "The AI is relying on **Mean Reversion**, heavily weighting how far the price deviates from its 20-day moving average. "
+    elif top_feature == 'DayOfYear':
+        analysis += "Historical **Seasonality** is dominating the model, implying the stock is rigidly following its typical annual patterns. "
+    elif top_feature == 'Lag_1_Ret':
+        analysis += "The model is operating in a **Momentum Regime**, placing the highest value on immediate, day-to-day price inertia. "
+        
+    analysis += f"\n\nWith an out-of-sample directional hit ratio of **{hit_ratio:.1f}%**, the model shows "
+    analysis += "moderate" if hit_ratio < 53 else "strong"
+    analysis += " confidence in this predictive structure."
+    
+    st.info(analysis)
