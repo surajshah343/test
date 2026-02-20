@@ -6,6 +6,7 @@ import requests
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from datetime import date, datetime, timedelta
 import yfinance as yf
+from yahooquery import Ticker as YQTicker
 import pandas_datareader.data as web
 from plotly import graph_objs as go
 from plotly.subplots import make_subplots
@@ -17,7 +18,7 @@ from sklearn.preprocessing import StandardScaler
 
 # --- CONFIGURATION ---
 os.makedirs("saved_models", exist_ok=True)
-st.set_page_config(page_title="AI Quant Pro v11.0 - Resilient DL", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v12.0 - Bulletproof DL", layout="wide")
 st.title('🧠 Financial AI: LSTM Deep Learning Framework & Backtester')
 
 # --- SIDEBAR ---
@@ -31,43 +32,56 @@ seq_length = st.sidebar.slider('LSTM Lookback Window (Days):', 10, 60, value=20)
 MODEL_WEIGHTS_PATH = os.path.join("saved_models", f"{ticker_input}_lstm_weights.pth")
 retrain_button = st.sidebar.button("🔄 Force Model Retrain")
 
-# --- 1. RESILIENT DATA ACQUISITION & FEATURE ENGINEERING ---
+# --- 1. MULTI-TIER RESILIENT DATA ACQUISITION ---
 @st.cache_data(show_spinner=False)
 def load_and_prep_data(ticker):
     df = pd.DataFrame()
     
-    # Try 1: yfinance with Custom User-Agent Bypass
+    # Tier 1: yfinance with thread-locking fix
     try:
         session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        df = yf.download(ticker, period="10y", session=session)
-        
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+        # threads=False is crucial to prevent Streamlit Cloud deadlocks
+        df = yf.download(ticker, period="10y", session=session, threads=False)
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.get_level_values(0)
-            
         if df.empty:
-            raise ValueError("yfinance returned an empty dataset.")
-            
-    except Exception as e:
-        st.warning(f"Primary API blocked. Rerouting to Stooq backup server...")
+            raise ValueError("yfinance blocked.")
+        df.reset_index(inplace=True)
         
-        # Try 2: pandas-datareader via Stooq API (No Key Required)
+    except Exception:
+        st.toast("Tier 1 (yfinance) blocked. Rerouting to Tier 2 (Yahoo Internal API)...", icon="⚠️")
+        
+        # Tier 2: yahooquery (Internal JSON API Bypass)
         try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=365*10)
-            df = web.DataReader(ticker, 'stooq', start=start_date, end=end_date)
-            df = df.sort_index(ascending=True) # Stooq returns dates in descending order
-        except Exception as e2:
-            st.error(f"Critical Failure: Both primary and backup APIs rejected the request for {ticker}. Ensure the ticker is valid.")
-            return None
+            yq = YQTicker(ticker)
+            df = yq.history(period="10y")
+            if df.empty or 'error' in df:
+                raise ValueError("yahooquery blocked.")
+            df = df.reset_index()
+            # Standardize columns to match yfinance format
+            df.rename(columns={'date': 'Date', 'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'volume': 'Volume'}, inplace=True)
+            
+        except Exception:
+            st.toast("Tier 2 completely blocked. Rerouting to Tier 3 (Stooq Server)...", icon="🚨")
+            
+            # Tier 3: Stooq Data Backup
+            try:
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=365*10)
+                df = web.DataReader(ticker, 'stooq', start=start_date, end=end_date)
+                df = df.sort_index(ascending=True).reset_index()
+            except Exception:
+                st.error(f"Critical Failure: All 3 data pipelines blocked for {ticker}. The ticker may be invalid or servers are entirely down.")
+                return None
 
-    df.reset_index(inplace=True)
-    
     # Standardize 'Date' column name if APIs return slightly different casing
     if 'Date' not in df.columns and 'date' in df.columns:
         df.rename(columns={'date': 'Date'}, inplace=True)
+        
+    # Ensure timezone awareness doesn't break Plotly
+    if df['Date'].dt.tz is not None:
+        df['Date'] = df['Date'].dt.tz_localize(None)
     
     # --- Feature Engineering ---
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
@@ -87,7 +101,7 @@ def load_and_prep_data(ticker):
     
     return df.dropna().copy()
 
-with st.spinner(f"Establishing secure data link for {ticker_input}..."):
+with st.spinner(f"Establishing multi-tier data link for {ticker_input}..."):
     df = load_and_prep_data(ticker_input)
 if df is None:
     st.stop()
@@ -202,121 +216,4 @@ def run_backtest(_model, _X_test, _actual_returns, _scaler_y):
     strategy_returns = positions * _actual_returns.values
     
     cum_bh_returns = (1 + _actual_returns).cumprod() - 1
-    cum_strat_returns = (1 + strategy_returns).cumprod() - 1
-    
-    win_rate = np.mean(strategy_returns > 0) * 100
-    strat_total_ret = cum_strat_returns.iloc[-1] * 100
-    bh_total_ret = cum_bh_returns.iloc[-1] * 100
-    
-    return cum_bh_returns, cum_strat_returns, win_rate, strat_total_ret, bh_total_ret, positions
-
-st.markdown("### ⏳ Running Walk-Forward Backtest...")
-bt_progress = st.progress(0)
-bt_status = st.empty()
-
-bt_phrases = [
-    "Simulating past mistakes...",
-    "Hindsight is 20/20, computing...",
-    "Liquidating imaginary margin calls...",
-    "Counting hypothetical lambos..."
-]
-
-for i in range(100):
-    bt_progress.progress(i + 1)
-    phrase_idx = int((i / 100) * len(bt_phrases))
-    bt_status.text(f"Backtesting | {bt_phrases[min(phrase_idx, len(bt_phrases)-1)]}")
-    time.sleep(0.01)
-    
-bt_progress.empty()
-bt_status.empty()
-
-bh_curve, strat_curve, win_rate, strat_ret, bh_ret, positions = run_backtest(model, X_test, actual_returns, scaler_y)
-
-# --- 6. UI & DASHBOARD ---
-st.markdown("---")
-st.subheader("🕵️‍♂️ 1-Year AI Backtest Results (Out-of-Sample)")
-
-b1, b2, b3 = st.columns(3)
-b1.metric("Buy & Hold Return", f"{bh_ret:.1f}%", help="Total return from simply holding the asset for the last year.")
-b2.metric("AI Strategy Return", f"{strat_ret:.1f}%", delta=f"{strat_ret - bh_ret:.1f}% vs B&H", help="Total return from the AI's daily Long/Short strategy.")
-b3.metric("AI Win Rate", f"{win_rate:.1f}%", help="The percentage of days the AI's position resulted in a profit.")
-
-fig_bt = go.Figure()
-fig_bt.add_trace(go.Scatter(x=backtest_dates, y=bh_curve * 100, name='Buy & Hold (Benchmark)', line=dict(color='#95a5a6', width=2, dash='dot')))
-fig_bt.add_trace(go.Scatter(x=backtest_dates, y=strat_curve * 100, name='AI Strategy (Long/Short)', line=dict(color='#2ecc71', width=3)))
-
-for i in range(len(positions) - 1):
-    color = "rgba(46, 204, 113, 0.1)" if positions[i] == 1 else "rgba(231, 76, 60, 0.1)"
-    fig_bt.add_vrect(x0=backtest_dates[i], x1=backtest_dates[i+1], fillcolor=color, layer="below", line_width=0)
-
-fig_bt.update_layout(
-    template="plotly_white", 
-    hovermode="x unified", 
-    height=450, 
-    yaxis_title="Cumulative Return (%)", 
-    title="Hypothetical 1-Year Performance vs Benchmark",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-st.plotly_chart(fig_bt, use_container_width=True)
-
-# --- 7. STABILIZED FUTURE SIMULATION ---
-@st.cache_data(show_spinner=False)
-def run_lstm_simulation(_model, base_data, n_days, n_sims, _scaler_X, _scaler_y, _seq_length):
-    _model.eval()
-    last_price = base_data['Close'].iloc[-1]
-    
-    max_annual_drift = 0.25 
-    daily_drift_cap = max_annual_drift / 252
-
-    last_seq = base_data[features].tail(_seq_length).values
-    last_seq_scaled = _scaler_X.transform(last_seq)
-    
-    all_paths = np.zeros((n_days, n_sims))
-    current_prices = np.full(n_sims, last_price)
-    historical_vol = base_data['Log_Ret'].std()
-    
-    with torch.no_grad():
-        for d in range(n_days):
-            seq_tensor = torch.FloatTensor(last_seq_scaled).unsqueeze(0)
-            pred_scaled = _model(seq_tensor).item()
-            pred_ret = _scaler_y.inverse_transform([[pred_scaled]])[0][0]
-            
-            pred_ret = np.clip(pred_ret, -daily_drift_cap, daily_drift_cap)
-            shocks = np.random.normal(0, historical_vol, n_sims)
-            daily_returns = pred_ret + shocks
-            
-            current_prices = current_prices * np.exp(daily_returns)
-            current_prices = np.maximum(current_prices, 0.01)
-            all_paths[d, :] = current_prices
-            
-    return all_paths
-
-with st.spinner(f"Simulating {n_simulations} future paths for {n_years} years..."):
-    sim_results = run_lstm_simulation(model, df, forecast_days, n_simulations, scaler_X, scaler_y, seq_length)
-
-median_forecast = np.median(sim_results, axis=1)
-upper_95_bound = np.percentile(sim_results, 97.5, axis=1)
-lower_95_bound = np.percentile(sim_results, 2.5, axis=1)
-
-st.markdown("---")
-st.subheader(f"🔮 Forward-Looking Monte Carlo Projection ({n_years}Y)")
-
-fig_main = go.Figure()
-hist_plot = df.tail(252)
-fig_main.add_trace(go.Scatter(x=hist_plot['Date'], y=hist_plot['Close'], name='Historical Price', line=dict(color='#2c3e50', width=2)))
-
-future_dates = pd.date_range(df['Date'].max(), periods=forecast_days + 1, freq='B')[1:]
-
-fig_main.add_trace(go.Scatter(x=future_dates, y=upper_95_bound, line=dict(width=0), showlegend=False))
-fig_main.add_trace(go.Scatter(x=future_dates, y=lower_95_bound, line=dict(width=0), fill='tonexty', fillcolor='rgba(41, 128, 185, 0.2)', name='95% Confidence Interval'))
-fig_main.add_trace(go.Scatter(x=future_dates, y=median_forecast, name='AI Median Trajectory', line=dict(color='#e74c3c', width=3)))
-
-fig_main.update_layout(
-    template="plotly_white", 
-    hovermode="x unified", 
-    height=600, 
-    yaxis_title="Asset Price ($)",
-    title=f"{ticker_input} Price Forecast",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-st.plotly_chart(fig_main, use_container_width=True)
+    cum_strat_returns = (1 + strategy
