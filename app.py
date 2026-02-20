@@ -13,7 +13,7 @@ from sklearn.metrics import mean_absolute_error
 TODAY = date.today()
 os.makedirs("saved_models", exist_ok=True)
 
-st.set_page_config(page_title="AI Quant Pro v8.0", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v8.1", layout="wide")
 st.title('🧠 Financial AI: Auto-Optimizing Quantitative Framework')
 
 # --- SIDEBAR ---
@@ -28,7 +28,7 @@ if retrain_button:
     st.cache_data.clear()
     st.sidebar.success("Cache Cleared. Retraining pipeline...")
 
-MODEL_FILE = f"saved_models/{ticker_input}_v8_0.json"
+MODEL_FILE = f"saved_models/{ticker_input}_v8_1.json"
 
 # --- 1. DYNAMIC HORIZON OPTIMIZER ---
 @st.cache_data(show_spinner="Optimizing Historical Data Horizon...")
@@ -47,13 +47,14 @@ def optimize_and_load_data(ticker):
         if len(raw_data) < days: continue
         
         df = raw_data.tail(days).copy()
-        
         df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
         df['MA20'] = df['Close'].rolling(20).mean()
         df['Vol_20'] = df['Log_Ret'].rolling(20).std()
         df['Lag_1_Ret'] = df['Log_Ret'].shift(1)
         df['SMA_20_Pct'] = (df['MA20'] / df['Close']) - 1
-        df['Target_Residual'] = df['Log_Ret'].shift(-1) - df['Log_Ret'].rolling(50).mean()
+        
+        # FIX: Predict the raw return, not a dynamic residual, to prevent explosive feedback
+        df['Target'] = df['Log_Ret'].shift(-1) 
         df['DayOfYear'] = df['Date'].dt.dayofyear / 366.0
         df.dropna(inplace=True)
         
@@ -64,10 +65,10 @@ def optimize_and_load_data(ticker):
         
         temp_model = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1, n_jobs=-1)
         features = ['Lag_1_Ret', 'SMA_20_Pct', 'Vol_20', 'DayOfYear']
-        temp_model.fit(train[features], train['Target_Residual'])
+        temp_model.fit(train[features], train['Target'])
         
         preds = temp_model.predict(test[features])
-        hit_ratio = np.mean(np.sign(preds) == np.sign(test['Target_Residual'].values)) * 100
+        hit_ratio = np.mean(np.sign(preds) == np.sign(test['Target'].values)) * 100
         
         if hit_ratio > best_hit_ratio:
             best_hit_ratio = hit_ratio
@@ -105,14 +106,14 @@ def build_full_dataset(df):
     
     df['Lag_1_Ret'] = df['Log_Ret'].shift(1)
     df['SMA_20_Pct'] = (df['MA20'] / df['Close']) - 1
-    df['Target_Residual'] = df['Log_Ret'].shift(-1) - df['Log_Ret'].rolling(50).mean()
+    df['Target'] = df['Log_Ret'].shift(-1)
     df['DayOfYear'] = df['Date'].dt.dayofyear / 366.0
     
     return df.dropna().copy()
 
 ml_data = build_full_dataset(raw_optimal_data)
 features = ['Lag_1_Ret', 'SMA_20_Pct', 'Vol_20', 'DayOfYear']
-target = 'Target_Residual'
+target = 'Target'
 
 split_idx = int(len(ml_data) * 0.8)
 train_set = ml_data.iloc[:split_idx]
@@ -131,17 +132,16 @@ else:
 test_preds = final_model.predict(test_set[features])
 final_hit_ratio = np.mean(np.sign(test_preds) == np.sign(test_set[target].values)) * 100
 
-# --- 4. VECTORIZED SIMULATION ENGINE WITH BOUNDARY SAFEGUARDS ---
+# --- 4. VECTORIZED SIMULATION ENGINE WITH STABLE DYNAMICS ---
 @st.cache_data(show_spinner="Simulating Stabilized Stochastic Paths...")
 def run_simulation(_model, _historical_df, n_days, n_sims):
     last_price = _historical_df['Close'].iloc[-1]
     
-    # Extract historical extremes to prevent mathematical explosions
+    # Establish strict historical boundaries
     hist_max_vol = _historical_df['Vol_20'].max()
-    hist_max_ret = _historical_df['Log_Ret'].max()
-    hist_min_ret = _historical_df['Log_Ret'].min()
     
-    hist_log_ret = np.tile(_historical_df['Log_Ret'].tail(50).values, (n_sims, 1)).T 
+    # Create tracking matrices
+    hist_log_ret = np.tile(_historical_df['Log_Ret'].tail(20).values, (n_sims, 1)).T 
     hist_prices = np.tile(_historical_df['Close'].tail(20).values, (n_sims, 1)).T
     
     all_paths = np.zeros((n_days, n_sims))
@@ -149,10 +149,10 @@ def run_simulation(_model, _historical_df, n_days, n_sims):
     
     for d in range(n_days):
         current_ma20 = np.mean(hist_prices[-20:], axis=0)
-        
-        # STATISTICAL CLAMP 1: Prevent Volatility Explosion. Cap at 1.5x historical maximum.
         current_vol20 = np.std(hist_log_ret[-20:], axis=0, ddof=1)
-        current_vol20 = np.clip(current_vol20, 0.001, hist_max_vol * 1.5)
+        
+        # Clamp volatility to prevent explosions
+        current_vol20 = np.clip(current_vol20, 0.005, hist_max_vol * 1.5)
         
         lag_1_ret = hist_log_ret[-1]
         
@@ -163,23 +163,22 @@ def run_simulation(_model, _historical_df, n_days, n_sims):
             'DayOfYear': [(datetime.now().timetuple().tm_yday + d) % 366 / 366.0] * n_sims
         })
         
-        alpha = _model.predict(pred_feat)
-        rolling_50_mean = np.mean(hist_log_ret[-50:], axis=0)
+        # AI predicts base directional return
+        ai_pred_ret = _model.predict(pred_feat)
+        
+        # Add normal stochastic shock based on current local volatility
         shocks = np.random.normal(0, current_vol20, n_sims)
+        log_returns = ai_pred_ret + shocks
         
-        # Calculate returns
-        log_returns = alpha + rolling_50_mean + shocks
-        
-        # STATISTICAL CLAMP 2: Prevent exponential drift. Cap daily returns to 3x historical extremes.
-        log_returns = np.clip(log_returns, hist_min_ret * 3.0, hist_max_ret * 3.0)
+        # Strict hard cap on daily movements (e.g. +/- 15% max per day) to maintain mathematical stability
+        log_returns = np.clip(log_returns, -0.15, 0.15)
         
         current_prices = current_prices * np.exp(log_returns)
-        
-        # STATISTICAL CLAMP 3: Prevent absolute price dropping below $0.01
-        current_prices = np.maximum(current_prices, 0.01)
+        current_prices = np.maximum(current_prices, 0.01) # Floor at 1 cent
         
         all_paths[d, :] = current_prices
         
+        # Roll the arrays forward
         hist_prices = np.vstack((hist_prices[1:], current_prices))
         hist_log_ret = np.vstack((hist_log_ret[1:], log_returns))
         
@@ -224,10 +223,10 @@ min_30d = np.min(forecast_30d)
 
 # --- 6. UI & CHARTS WITH TOOLTIPS ---
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Current Price", f"${initial_price:.2f}", help="The latest available daily closing price for the selected ticker.")
-m2.metric("OOS Hit Ratio", f"{final_hit_ratio:.1f}%", help="Out-Of-Sample Accuracy: How often the AI correctly predicted the directional drift of the asset on unseen testing data.")
-m3.metric("Terminal 95% VaR", f"{terminal_var_95_pct:.1f}%", help=f"Value at Risk: Based on the Monte Carlo simulation, there is only a 5% chance the asset's value drops below ${terminal_var_95_price:.2f} at the end of the {n_years}-year horizon.")
-m4.metric("Test MAE", f"{mean_absolute_error(test_set[target], test_preds):.5f}", help="Mean Absolute Error: The average magnitude of the AI's prediction errors on unseen data. Lower is better.")
+m1.metric("Current Price", f"${initial_price:.2f}", help="The latest available daily closing price.")
+m2.metric("OOS Hit Ratio", f"{final_hit_ratio:.1f}%", help="Out-Of-Sample Directional Accuracy.")
+m3.metric("Terminal 95% VaR", f"{terminal_var_95_pct:.1f}%", help=f"5% chance of dropping below ${terminal_var_95_price:.2f}.")
+m4.metric("Test MAE", f"{mean_absolute_error(test_set[target], test_preds):.5f}", help="Mean Absolute Error of the AI on unseen data.")
 
 st.markdown("---")
 st.subheader("🔮 30-Day AI Fibonacci Breakout Matrix")
@@ -248,11 +247,11 @@ with col_res:
 
 with col_out:
     if resistance_level and max_30d > resistance_level[1]:
-        st.success(f"📈 **AI Outlook:** The AI projects upward momentum to **break resistance** at ${resistance_level[1]:.2f} within the next 30 days. Max projected peak: ${max_30d:.2f}.")
+        st.success(f"📈 **AI Outlook:** The AI projects an upward breakout of resistance at ${resistance_level[1]:.2f}.")
     elif support_level and min_30d < support_level[1]:
-        st.error(f"📉 **AI Outlook:** The AI projects downward drift, expecting a **support break** at ${support_level[1]:.2f} within the next 30 days. Min projected dip: ${min_30d:.2f}.")
+        st.error(f"📉 **AI Outlook:** The AI projects a downward support break at ${support_level[1]:.2f}.")
     else:
-        st.info(f"⚖️ **AI Outlook:** The AI projects **consolidation** within the current Fibonacci channel over the next 30 days. Bounds: ${min_30d:.2f} to ${max_30d:.2f}.")
+        st.info(f"⚖️ **AI Outlook:** Consolidation within current Fibonacci channel bounds (${min_30d:.2f} - ${max_30d:.2f}).")
 
 st.markdown("---")
 
