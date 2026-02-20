@@ -1,7 +1,5 @@
 import streamlit as st
 import os
-import time
-import requests
 import yfinance as yf
 from datetime import datetime, timedelta
 import pandas as pd
@@ -12,165 +10,131 @@ from sklearn.preprocessing import StandardScaler
 from plotly import graph_objs as go
 from plotly.subplots import make_subplots
 
-# --- CONFIGURATION & SIDEBAR (Defined first to prevent NameError) ---
+# --- 1. INITIALIZATION & SIDEBAR ---
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-st.set_page_config(page_title="AI Quant Pro v14", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v16 - Risk Integrated", layout="wide")
+
+if 'needs_retrain' not in st.session_state:
+    st.session_state.needs_retrain = True
 
 st.sidebar.header("🕹️ Control Panel")
 ticker_input = st.sidebar.text_input("Ticker Symbol:", value="AMZN").upper()
 n_years = st.sidebar.slider('Forecast Horizon (Years):', 1, 3, value=1)
 seq_length = st.sidebar.slider('Lookback Window (Days):', 10, 60, value=30)
-train_button = st.sidebar.button("🚀 Run Analysis & AI Training")
 
-st.title(f"🧠 AI Financial Framework: {ticker_input}")
+if st.sidebar.button("🔄 Force Model Retrain"):
+    st.session_state.needs_retrain = True
 
-# --- 1. MATHEMATICAL LOGIC & TECHNICAL INDICATORS ---
+st.title(f"🧠 AI Quant & Risk Framework: {ticker_input}")
+
+# --- 2. DATA & HYBRID MODEL ---
 @st.cache_data
-def get_advanced_data(ticker):
-    # Fetch 5 years of data for stable Fibonacci and MACD calculation
+def get_data(ticker):
     df = yf.download(ticker, period="5y", interval="1d", progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.reset_index()
-    
-    # RSI: Standard Wilder's Smoothing logic
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    df['RSI'] = 100 - (100 / (1 + (gain / loss)))
-    
-    # MACD: 12-26-9 Standard
-    df['EMA12'] = df['Close'].ewm(span=12, adjust=False).mean()
-    df['EMA26'] = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = df['EMA12'] - df['EMA26']
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
-    
-    # Bollinger Bands
-    df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['20STD'] = df['Close'].rolling(window=20).std()
-    df['BB_Upper'] = df['MA20'] + (df['20STD'] * 2)
-    df['BB_Lower'] = df['MA20'] - (df['20STD'] * 2)
-
-    # Fibonacci Retracement (Standard 52-week swing)
-    recent_yr = df.tail(252)
-    high, low = recent_yr['High'].max(), recent_yr['Low'].min()
-    diff = high - low
-    df['Fib_100'] = high
-    df['Fib_618'] = high - 0.382 * diff
-    df['Fib_500'] = high - 0.500 * diff
-    df['Fib_382'] = high - 0.618 * diff
-    df['Fib_0']   = low
-
-    # Target: Next day Log Return (Stationary Target)
+    # Indicators
+    df['RSI'] = 100 - (100 / (1 + (df['Close'].diff().clip(lower=0).rolling(14).mean() / -df['Close'].diff().clip(upper=0).rolling(14).mean())))
+    df['MACD'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD'].ewm(span=9).mean()
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol_20'] = df['Log_Ret'].rolling(20).std()
     df['Target'] = df['Log_Ret'].shift(-1)
-    
     return df.dropna().reset_index(drop=True)
 
-# --- 2. LSTM MODEL ARCHITECTURE ---
-class QuantLSTM(nn.Module):
+class HybridModel(nn.Module):
     def __init__(self, input_size):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, 64, 2, batch_first=True, dropout=0.1)
+        self.cnn = nn.Conv1d(input_size, 32, kernel_size=3, padding=1)
+        self.gru = nn.GRU(32, 64, 2, batch_first=True, dropout=0.1)
         self.fc = nn.Linear(64, 1)
-
     def forward(self, x):
-        out, _ = self.lstm(x)
+        x = x.permute(0, 2, 1)
+        x = torch.relu(self.cnn(x)).permute(0, 2, 1)
+        out, _ = self.gru(x)
         return self.fc(out[:, -1, :])
 
-# --- 3. EXECUTION LOGIC ---
-if ticker_input and train_button:
-    df = get_advanced_data(ticker_input)
-    latest = df.iloc[-1]
+# --- 3. EXECUTION ---
+df = get_data(ticker_input)
+features = ['Log_Ret', 'Vol_20', 'RSI', 'MACD_Hist']
+split = int(len(df) * 0.8)
+train_df = df.iloc[:split]
 
-    # --- TOP METRIC ROW WITH TOOLTIPS ---
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("RSI (14D)", f"{latest['RSI']:.1f}", 
-              help="**Relative Strength Index**: Measures momentum. Over 70 is 'Overbought' (sell signal), under 30 is 'Oversold' (buy signal).")
-    m2.metric("MACD Hist", f"{latest['MACD_Hist']:.2f}", 
-              help="**MACD Histogram**: Shows the trend strength. Rising green bars suggest bullish acceleration; falling red bars suggest bearish momentum.")
-    m3.metric("BB Bandwidth", f"{(latest['BB_Upper'] - latest['BB_Lower']):.2f}", 
-              help="**Bollinger Bandwidth**: Measures volatility. A narrow band (The Squeeze) often precedes a massive price explosion.")
-    m4.metric("Fib 61.8% Level", f"${latest['Fib_618']:.2f}", 
-              help="**The Golden Ratio**: A key support level. If the price stays above this during a pullback, the bull trend is likely to continue.")
+scaler_X = StandardScaler().fit(train_df[features])
+scaler_y = StandardScaler().fit(train_df[['Target']])
 
-    # --- AI TRAINING (LEAKAGE-FREE) ---
-    features = ['Log_Ret', 'Vol_20', 'RSI', 'MACD_Hist']
-    split = int(len(df) * 0.8)
-    train_df, test_df = df.iloc[:split], df.iloc[split:]
+if st.session_state.needs_retrain:
+    X_sc = scaler_X.transform(train_df[features])
+    y_sc = scaler_y.transform(train_df[['Target']])
+    xs, ys = [], []
+    for i in range(len(X_sc) - seq_length):
+        xs.append(X_sc[i:i+seq_length]); ys.append(y_sc[i+seq_length])
     
-    scaler_X = StandardScaler().fit(train_df[features])
-    scaler_y = StandardScaler().fit(train_df[['Target']])
-
-    def prepare_seq(data, s_X, s_y):
-        X_sc = s_X.transform(data[features])
-        y_sc = s_y.transform(data[['Target']])
-        xs, ys = [], []
-        for i in range(len(X_sc) - seq_length):
-            xs.append(X_sc[i:(i + seq_length)])
-            ys.append(y_sc[i + seq_length])
-        return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
-
-    X_train, y_train = prepare_seq(train_df, scaler_X, scaler_y)
-    model = QuantLSTM(len(features))
+    model = HybridModel(len(features))
     opt = torch.optim.Adam(model.parameters(), lr=0.001)
-    
-    with st.spinner("Training Neural Network..."):
-        for _ in range(30):
-            model.train()
-            opt.zero_grad()
-            loss = nn.MSELoss()(model(X_train), y_train)
-            loss.backward()
-            opt.step()
+    for _ in range(40):
+        model.train(); opt.zero_grad()
+        nn.MSELoss()(model(torch.FloatTensor(np.array(xs))), torch.FloatTensor(np.array(ys))).backward()
+        opt.step()
+    st.session_state.model = model
+    st.session_state.needs_retrain = False
 
-    # --- RECURSIVE FORWARD FORECAST ---
-    forecast_days = int(n_years * 252)
-    last_seq = scaler_X.transform(df[features].tail(seq_length))
-    current_price = df['Close'].iloc[-1]
-    preds = []
-    
-    model.eval()
-    with torch.no_grad():
+# --- 4. MULTI-PATH FORECAST & RISK ---
+model = st.session_state.model
+n_sims = 100
+forecast_days = int(n_years * 252)
+all_paths = []
+
+model.eval()
+with torch.no_grad():
+    for _ in range(n_sims):
+        last_seq = scaler_X.transform(df[features].tail(seq_length))
+        current_price = df['Close'].iloc[-1]
+        path = []
         for _ in range(forecast_days):
             inp = torch.FloatTensor(last_seq).unsqueeze(0)
-            ret_scaled = model(inp).item()
-            ret = scaler_y.inverse_transform([[ret_scaled]])[0][0]
-            
-            # Stochastic Drift
-            drifted_ret = ret + np.random.normal(0, df['Log_Ret'].std())
-            current_price *= np.exp(drifted_ret)
-            preds.append(current_price)
-            
-            # Update sequence for next day
-            new_feat = [drifted_ret, df['Log_Ret'].std(), 50.0, 0.0]
-            new_feat_sc = scaler_X.transform([new_feat])
-            last_seq = np.append(last_seq[1:], new_feat_sc, axis=0)
+            ret = scaler_y.inverse_transform([[model(inp).item()]])[0][0]
+            # Add volatility shock
+            ret += np.random.normal(0, df['Log_Ret'].std())
+            current_price *= np.exp(ret)
+            path.append(current_price)
+            # Update seq
+            new_feat = scaler_X.transform([[ret, df['Log_Ret'].std(), 50, 0]])
+            last_seq = np.append(last_seq[1:], new_feat, axis=0)
+        all_paths.append(path)
 
-    # --- ADVANCED PLOTLY DASHBOARD ---
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                        subplot_titles=('Price & Technicals', 'MACD', 'RSI'), row_width=[0.2, 0.2, 0.6])
+# Calculate Risk Metrics
+final_prices = np.array([p[-1] for p in all_paths])
+starting_price = df['Close'].iloc[-1]
+total_returns = (final_prices - starting_price) / starting_price
 
-    # Price, BB, and Forecast
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name='Historic Price', line=dict(color='blue')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], line=dict(color='rgba(173,216,230,0.5)', dash='dot'), name='BB Upper'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], line=dict(color='rgba(173,216,230,0.5)', dash='dot'), fill='tonexty', name='BB Lower'), row=1, col=1)
-    
-    f_dates = [df['Date'].iloc[-1] + timedelta(days=i) for i in range(1, forecast_days+1)]
-    fig.add_trace(go.Scatter(x=f_dates, y=preds, name='AI Forecast', line=dict(color='red', width=3)), row=1, col=1)
+var_95 = np.percentile(total_returns, 5)
+cvar_95 = total_returns[total_returns <= var_95].mean()
 
-    # MACD
-    colors = ['green' if x > 0 else 'red' for x in df['MACD_Hist']]
-    fig.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], marker_color=colors, name='MACD Hist'), row=2, col=1)
+# --- 5. RISK DASHBOARD ---
+st.markdown("---")
+st.subheader("🛡️ AI-Driven Risk Assessment")
+r1, r2, r3 = st.columns(3)
 
-    # RSI
-    fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='purple'), name='RSI'), row=3, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+r1.metric("95% Value at Risk (VaR)", f"{var_95*100:.1f}%", 
+          help="**Value at Risk**: There is a 95% chance you will NOT lose more than this amount over the forecast period.")
+r2.metric("Conditional VaR (CVaR)", f"{cvar_95*100:.1f}%", 
+          help="**Expected Shortfall**: If the market enters the 'worst 5%' scenario, this is the average loss you can expect. It is more realistic than VaR.")
+r3.metric("Max Forecasted Gain", f"{total_returns.max()*100:.1f}%", 
+          help="The highest possible upside observed across all 100 AI simulations.")
 
-    fig.update_layout(height=900, template="plotly_white", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
+with st.expander("📝 What do these numbers mean for me?"):
+    st.write(f"""
+    - **Conservative View:** You should be prepared for a potential drop of **{abs(var_95*100):.1f}%**. If you can't afford this, consider a smaller position.
+    - **Worst Case (CVaR):** In a extreme market crash, the AI predicts an average drop of **{abs(cvar_95*100):.1f}%**.
+    - **AI Verdict:** If the gain metric in the chart is significantly higher than the VaR, the 'Risk-Reward' ratio is mathematically favorable.
+    """)
 
-else:
-    st.info("👈 Enter a ticker and click 'Run Analysis' to generate the AI model.")
+# --- 6. VISUALIZATION ---
+fig = go.Figure()
+for p in all_paths[:20]: # Show 20 sample paths
+    fig.add_trace(go.Scatter(y=p, line=dict(width=0.5), opacity=0.2, showlegend=False))
+fig.add_trace(go.Scatter(y=np.median(all_paths, axis=0), name="AI Median Forecast", line=dict(color='red', width=3)))
+fig.update_layout(title="Monte Carlo Risk Paths", template="plotly_white", yaxis_title="Price ($)")
+st.plotly_chart(fig, use_container_width=True)
