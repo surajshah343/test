@@ -10,10 +10,11 @@ from sklearn.preprocessing import StandardScaler
 from plotly import graph_objs as go
 from plotly.subplots import make_subplots
 
-# --- 1. INITIALIZATION & SIDEBAR ---
+# --- 1. INITIALIZATION & SIDEBAR (Prevents NameError) ---
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-st.set_page_config(page_title="AI Quant Pro v16 - Risk Integrated", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v15 - Hybrid CNN-GRU", layout="wide")
 
+# Initialize session state for retraining logic
 if 'needs_retrain' not in st.session_state:
     st.session_state.needs_retrain = True
 
@@ -22,41 +23,78 @@ ticker_input = st.sidebar.text_input("Ticker Symbol:", value="AMZN").upper()
 n_years = st.sidebar.slider('Forecast Horizon (Years):', 1, 3, value=1)
 seq_length = st.sidebar.slider('Lookback Window (Days):', 10, 60, value=30)
 
+# The Retrain Button
 if st.sidebar.button("🔄 Force Model Retrain"):
     st.session_state.needs_retrain = True
 
-st.title(f"🧠 AI Quant & Risk Framework: {ticker_input}")
+st.title(f"🧠 Hybrid CNN-GRU Quant Framework: {ticker_input}")
 
-# --- 2. DATA & HYBRID MODEL ---
+# --- 2. DATA ENGINE (Technicals & Math) ---
 @st.cache_data
-def get_data(ticker):
+def get_advanced_data(ticker):
     df = yf.download(ticker, period="5y", interval="1d", progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.reset_index()
-    # Indicators
-    df['RSI'] = 100 - (100 / (1 + (df['Close'].diff().clip(lower=0).rolling(14).mean() / -df['Close'].diff().clip(upper=0).rolling(14).mean())))
+    
+    # RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    df['RSI'] = 100 - (100 / (1 + (gain / loss)))
+    
+    # MACD
     df['MACD'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
-    df['MACD_Hist'] = df['MACD'] - df['MACD'].ewm(span=9).mean()
+    df['Signal_Line'] = df['MACD'].ewm(span=9).mean()
+    df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
+    
+    # Bollinger Bands
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['BB_Upper'] = df['MA20'] + (df['Close'].rolling(20).std() * 2)
+    df['BB_Lower'] = df['MA20'] - (df['Close'].rolling(20).std() * 2)
+
+    # Fibonacci (52-week)
+    recent = df.tail(252)
+    h, l = recent['High'].max(), recent['Low'].min()
+    df['Fib_618'] = h - 0.382 * (h - l)
+
+    # Stationary Target
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol_20'] = df['Log_Ret'].rolling(20).std()
     df['Target'] = df['Log_Ret'].shift(-1)
+    
     return df.dropna().reset_index(drop=True)
 
+# --- 3. HYBRID CNN-GRU ARCHITECTURE ---
 class HybridModel(nn.Module):
     def __init__(self, input_size):
         super().__init__()
-        self.cnn = nn.Conv1d(input_size, 32, kernel_size=3, padding=1)
-        self.gru = nn.GRU(32, 64, 2, batch_first=True, dropout=0.1)
+        # CNN extracts spatial patterns from the lookback window
+        self.cnn = nn.Conv1d(in_channels=input_size, out_channels=32, kernel_size=3, padding=1)
+        # GRU handles temporal memory
+        self.gru = nn.GRU(input_size=32, hidden_size=64, num_layers=2, batch_first=True, dropout=0.1)
         self.fc = nn.Linear(64, 1)
+
     def forward(self, x):
+        # x shape: [batch, seq, features] -> CNN needs [batch, features, seq]
         x = x.permute(0, 2, 1)
-        x = torch.relu(self.cnn(x)).permute(0, 2, 1)
+        x = torch.relu(self.cnn(x))
+        x = x.permute(0, 2, 1) # Back to [batch, seq, features]
         out, _ = self.gru(x)
         return self.fc(out[:, -1, :])
 
-# --- 3. EXECUTION ---
-df = get_data(ticker_input)
+# --- 4. EXECUTION FLOW ---
+df = get_advanced_data(ticker_input)
+latest = df.iloc[-1]
+
+# Interactive Metrics with Tooltips
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("RSI", f"{latest['RSI']:.1f}", help="Standard RSI. >70 is overbought, <30 is oversold.")
+m2.metric("MACD Hist", f"{latest['MACD_Hist']:.2f}", help="Difference between MACD and Signal Line. Rising = Stronger trend.")
+m3.metric("BB Bandwidth", f"{(latest['BB_Upper'] - latest['BB_Lower']):.2f}", help="Market volatility. Narrow = potential breakout.")
+m4.metric("Fib 61.8%", f"${latest['Fib_618']:.2f}", help="Major support/resistance level. Often called the 'Golden Ratio'.")
+
+# --- 5. DEEP LEARNING WORKFLOW ---
 features = ['Log_Ret', 'Vol_20', 'RSI', 'MACD_Hist']
 split = int(len(df) * 0.8)
 train_df = df.iloc[:split]
@@ -64,77 +102,67 @@ train_df = df.iloc[:split]
 scaler_X = StandardScaler().fit(train_df[features])
 scaler_y = StandardScaler().fit(train_df[['Target']])
 
-if st.session_state.needs_retrain:
-    X_sc = scaler_X.transform(train_df[features])
-    y_sc = scaler_y.transform(train_df[['Target']])
+def get_sequences(data, s_X, s_y):
+    X_sc = s_X.transform(data[features])
+    y_sc = s_y.transform(data[['Target']])
     xs, ys = [], []
     for i in range(len(X_sc) - seq_length):
-        xs.append(X_sc[i:i+seq_length]); ys.append(y_sc[i+seq_length])
-    
+        xs.append(X_sc[i:(i + seq_length)])
+        ys.append(y_sc[i + seq_length])
+    return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
+
+if st.session_state.needs_retrain:
+    X_train, y_train = get_sequences(train_df, scaler_X, scaler_y)
     model = HybridModel(len(features))
-    opt = torch.optim.Adam(model.parameters(), lr=0.001)
-    for _ in range(40):
-        model.train(); opt.zero_grad()
-        nn.MSELoss()(model(torch.FloatTensor(np.array(xs))), torch.FloatTensor(np.array(ys))).backward()
-        opt.step()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for epoch in range(50):
+        model.train()
+        optimizer.zero_grad()
+        loss = nn.MSELoss()(model(X_train), y_train)
+        loss.backward()
+        optimizer.step()
+        progress_bar.progress((epoch + 1) / 50)
+        status_text.text(f"Training Hybrid CNN-GRU... Loss: {loss.item():.5f}")
+    
     st.session_state.model = model
     st.session_state.needs_retrain = False
+    status_text.success("Model Trained Successfully!")
+    time.sleep(1)
+    status_text.empty()
+    progress_bar.empty()
 
-# --- 4. MULTI-PATH FORECAST & RISK ---
+# --- 6. FORECASTING & VIZ ---
 model = st.session_state.model
-n_sims = 100
 forecast_days = int(n_years * 252)
-all_paths = []
+last_seq = scaler_X.transform(df[features].tail(seq_length))
+price_trace = [df['Close'].iloc[-1]]
 
 model.eval()
 with torch.no_grad():
-    for _ in range(n_sims):
-        last_seq = scaler_X.transform(df[features].tail(seq_length))
-        current_price = df['Close'].iloc[-1]
-        path = []
-        for _ in range(forecast_days):
-            inp = torch.FloatTensor(last_seq).unsqueeze(0)
-            ret = scaler_y.inverse_transform([[model(inp).item()]])[0][0]
-            # Add volatility shock
-            ret += np.random.normal(0, df['Log_Ret'].std())
-            current_price *= np.exp(ret)
-            path.append(current_price)
-            # Update seq
-            new_feat = scaler_X.transform([[ret, df['Log_Ret'].std(), 50, 0]])
-            last_seq = np.append(last_seq[1:], new_feat, axis=0)
-        all_paths.append(path)
+    for _ in range(forecast_days):
+        inp = torch.FloatTensor(last_seq).unsqueeze(0)
+        ret_sc = model(inp).item()
+        ret = scaler_y.inverse_transform([[ret_sc]])[0][0]
+        
+        # Adding stochastic volatility for realism
+        real_ret = ret + np.random.normal(0, df['Log_Ret'].std() * 0.5)
+        price_trace.append(price_trace[-1] * np.exp(real_ret))
+        
+        # Recursive Sequence Update
+        new_row = [real_ret, df['Log_Ret'].std(), 50.0, 0.0] 
+        new_sc = scaler_X.transform([new_row])
+        last_seq = np.append(last_seq[1:], new_sc, axis=0)
 
-# Calculate Risk Metrics
-final_prices = np.array([p[-1] for p in all_paths])
-starting_price = df['Close'].iloc[-1]
-total_returns = (final_prices - starting_price) / starting_price
+# Final Visualization
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_width=[0.3, 0.7])
+fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name='Historic'), row=1, col=1)
+f_dates = [df['Date'].iloc[-1] + timedelta(days=i) for i in range(1, forecast_days+1)]
+fig.add_trace(go.Scatter(x=f_dates, y=price_trace[1:], name='AI Forecast', line=dict(color='red', width=2)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
 
-var_95 = np.percentile(total_returns, 5)
-cvar_95 = total_returns[total_returns <= var_95].mean()
-
-# --- 5. RISK DASHBOARD ---
-st.markdown("---")
-st.subheader("🛡️ AI-Driven Risk Assessment")
-r1, r2, r3 = st.columns(3)
-
-r1.metric("95% Value at Risk (VaR)", f"{var_95*100:.1f}%", 
-          help="**Value at Risk**: There is a 95% chance you will NOT lose more than this amount over the forecast period.")
-r2.metric("Conditional VaR (CVaR)", f"{cvar_95*100:.1f}%", 
-          help="**Expected Shortfall**: If the market enters the 'worst 5%' scenario, this is the average loss you can expect. It is more realistic than VaR.")
-r3.metric("Max Forecasted Gain", f"{total_returns.max()*100:.1f}%", 
-          help="The highest possible upside observed across all 100 AI simulations.")
-
-with st.expander("📝 What do these numbers mean for me?"):
-    st.write(f"""
-    - **Conservative View:** You should be prepared for a potential drop of **{abs(var_95*100):.1f}%**. If you can't afford this, consider a smaller position.
-    - **Worst Case (CVaR):** In a extreme market crash, the AI predicts an average drop of **{abs(cvar_95*100):.1f}%**.
-    - **AI Verdict:** If the gain metric in the chart is significantly higher than the VaR, the 'Risk-Reward' ratio is mathematically favorable.
-    """)
-
-# --- 6. VISUALIZATION ---
-fig = go.Figure()
-for p in all_paths[:20]: # Show 20 sample paths
-    fig.add_trace(go.Scatter(y=p, line=dict(width=0.5), opacity=0.2, showlegend=False))
-fig.add_trace(go.Scatter(y=np.median(all_paths, axis=0), name="AI Median Forecast", line=dict(color='red', width=3)))
-fig.update_layout(title="Monte Carlo Risk Paths", template="plotly_white", yaxis_title="Price ($)")
+fig.update_layout(height=700, template="plotly_white", hovermode="x unified", title=f"Hybrid Deep Learning Forecast: {ticker_input}")
 st.plotly_chart(fig, use_container_width=True)
