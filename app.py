@@ -7,7 +7,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from datetime import date, datetime, timedelta
 import yfinance as yf
 from yahooquery import Ticker as YQTicker
-import pandas_datareader.data as web
 from plotly import graph_objs as go
 from plotly.subplots import make_subplots
 import pandas as pd
@@ -18,10 +17,10 @@ from sklearn.preprocessing import StandardScaler
 
 # --- CONFIGURATION ---
 os.makedirs("saved_models", exist_ok=True)
-st.set_page_config(page_title="AI Quant Pro v12.0 - Bulletproof DL", layout="wide")
+st.set_page_config(page_title="AI Quant Pro v12.1 - Diagnostics", layout="wide")
 st.title('🧠 Financial AI: LSTM Deep Learning Framework & Backtester')
 
-# --- SIDEBAR ---
+# --- SIDEBAR & DIAGNOSTICS ---
 st.sidebar.header("Configuration")
 ticker_input = st.sidebar.text_input("Enter Ticker:", value="AMZN").upper()
 n_years = st.sidebar.slider('Forecast Horizon (Years):', 1, 4, value=3)
@@ -32,48 +31,55 @@ seq_length = st.sidebar.slider('LSTM Lookback Window (Days):', 10, 60, value=20)
 MODEL_WEIGHTS_PATH = os.path.join("saved_models", f"{ticker_input}_lstm_weights.pth")
 retrain_button = st.sidebar.button("🔄 Force Model Retrain")
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("📡 Connection Diagnostics")
+api_status_text = st.sidebar.empty()
+
 # --- 1. MULTI-TIER RESILIENT DATA ACQUISITION ---
 @st.cache_data(show_spinner=False)
 def load_and_prep_data(ticker):
     df = pd.DataFrame()
+    data_source = "None"
     
-    # Tier 1: yfinance with thread-locking fix
+    # Tier 1: yfinance (Front-End Scrape)
     try:
         session = requests.Session()
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
-        # threads=False is crucial to prevent Streamlit Cloud deadlocks
         df = yf.download(ticker, period="10y", session=session, threads=False)
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.get_level_values(0)
         if df.empty:
             raise ValueError("yfinance blocked.")
         df.reset_index(inplace=True)
+        data_source = "Tier 1: yfinance"
         
     except Exception:
-        st.toast("Tier 1 (yfinance) blocked. Rerouting to Tier 2 (Yahoo Internal API)...", icon="⚠️")
-        
-        # Tier 2: yahooquery (Internal JSON API Bypass)
+        # Tier 2: yahooquery (Internal JSON API)
         try:
             yq = YQTicker(ticker)
             df = yq.history(period="10y")
             if df.empty or 'error' in df:
                 raise ValueError("yahooquery blocked.")
             df = df.reset_index()
-            # Standardize columns to match yfinance format
             df.rename(columns={'date': 'Date', 'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'volume': 'Volume'}, inplace=True)
+            data_source = "Tier 2: yahooquery"
             
         except Exception:
-            st.toast("Tier 2 completely blocked. Rerouting to Tier 3 (Stooq Server)...", icon="🚨")
-            
-            # Tier 3: Stooq Data Backup
+            # Tier 3: Stooq Direct CSV Fetch (Bypassing pandas-datareader)
             try:
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=365*10)
-                df = web.DataReader(ticker, 'stooq', start=start_date, end=end_date)
-                df = df.sort_index(ascending=True).reset_index()
+                # Stooq format for US stocks generally requires .US suffix
+                stooq_url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
+                df = pd.read_csv(stooq_url)
+                
+                # Fallback if it's not a US stock and the .US suffix fails
+                if df.empty or 'Date' not in df.columns:
+                    stooq_url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
+                    df = pd.read_csv(stooq_url)
+                    
+                df['Date'] = pd.to_datetime(df['Date'])
+                data_source = "Tier 3: Stooq Backup"
             except Exception:
-                st.error(f"Critical Failure: All 3 data pipelines blocked for {ticker}. The ticker may be invalid or servers are entirely down.")
-                return None
+                return None, "All APIs Failed"
 
     # Standardize 'Date' column name if APIs return slightly different casing
     if 'Date' not in df.columns and 'date' in df.columns:
@@ -99,12 +105,17 @@ def load_and_prep_data(ticker):
     
     df['Target'] = df['Log_Ret'].shift(-1)
     
-    return df.dropna().copy()
+    return df.dropna().copy(), data_source
 
 with st.spinner(f"Establishing multi-tier data link for {ticker_input}..."):
-    df = load_and_prep_data(ticker_input)
+    df, active_source = load_and_prep_data(ticker_input)
+
 if df is None:
+    api_status_text.error("❌ Disconnected")
+    st.error(f"Critical Failure: All 3 data pipelines blocked for {ticker_input}. The ticker may be invalid or servers are temporarily down.")
     st.stop()
+else:
+    api_status_text.success(f"✅ Connected via {active_source}")
 
 # --- 2. LSTM MODEL DEFINITION ---
 class QuantLSTM(nn.Module):
