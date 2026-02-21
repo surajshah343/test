@@ -11,11 +11,12 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, f1_score
 from plotly import graph_objs as go
 import plotly.express as px
+import scipy.stats as stats
 
 # Setup hardware acceleration
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
-st.set_page_config(page_title="Pro Quant Dashboard", layout="wide")
+st.set_page_config(page_title="Pro Quant Dashboard", layout="wide", initial_sidebar_state="expanded")
 
 # --- 1. MODEL ARCHITECTURE (CNN + LSTM + Attention) ---
 class TemporalAttention(nn.Module):
@@ -28,7 +29,6 @@ class TemporalAttention(nn.Module):
         )
 
     def forward(self, lstm_out):
-        # lstm_out shape: (batch_size, seq_length, hidden_size)
         attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
         context_vector = torch.sum(attn_weights * lstm_out, dim=1)
         return context_vector, attn_weights
@@ -36,17 +36,13 @@ class TemporalAttention(nn.Module):
 class HybridQuantModel(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
-        # Spatial Feature Extraction
         self.cnn = nn.Sequential(
             nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1),
             nn.BatchNorm1d(64)
         )
-        # Temporal Processing
         self.lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True, dropout=0.3)
-        # Attention Mechanism
         self.attention = TemporalAttention(128)
-        # Fully Connected Regression Head
         self.fc = nn.Sequential(
             nn.Linear(128, 64),
             nn.GELU(),
@@ -55,16 +51,14 @@ class HybridQuantModel(nn.Module):
         )
 
     def forward(self, x):
-        # CNN expects (batch, channels, length)
         x = x.transpose(1, 2) 
         x = self.cnn(x)
-        # LSTM expects (batch, length, features)
         x = x.transpose(1, 2)
         lstm_out, _ = self.lstm(x)
         context, _ = self.attention(lstm_out)
         return self.fc(context)
 
-# --- 2. DATA PIPELINE & STRICT NO-LEAKAGE HELPERS ---
+# --- 2. DATA PIPELINE & HELPERS ---
 def calculate_rsi(series, window=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
@@ -79,16 +73,11 @@ def load_and_process(symbol):
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df = df.reset_index()
     
-    # Technical Features (Calculated on current day 't')
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol_20'] = df['Log_Ret'].rolling(20).std()
     df['RSI'] = calculate_rsi(df['Close'], 14)
-    
-    # Baseline Strategy Features
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
-    
-    # Support & Resistance (Strict Leakage Prevention: Shift by 1)
     df['Support_60d'] = df['Low'].shift(1).rolling(window=60).min()
     df['Resistance_60d'] = df['High'].shift(1).rolling(window=60).max()
     
@@ -106,13 +95,22 @@ def get_fundamentals(symbol):
         ic = pd.DataFrame()
     return info, bs, ic
 
+@st.cache_data(ttl=3600)
+def get_options_data(symbol):
+    tkr = yf.Ticker(symbol)
+    expirations = tkr.options
+    if not expirations:
+        return None, None, None
+    front_month = expirations[0]
+    chain = tkr.option_chain(front_month)
+    return expirations, chain.calls, chain.puts
+
 def create_sequences(data, features, target_col, s_x, s_y, window):
     x_sc = s_x.transform(data[features])
     y_sc = s_y.transform(data[[target_col]])
     xs, ys = [], []
     for i in range(len(x_sc) - window):
         xs.append(x_sc[i:i+window])
-        # Target natively aligns with the period *following* the window
         ys.append(y_sc[i+window])
     return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
 
@@ -139,9 +137,20 @@ def get_financial_metric(df, keys):
             if pd.notna(val): return val
     return None
 
+def black_scholes_price(S, K, T, r, sigma, option_type="call"):
+    if T <= 0 or sigma <= 0:
+        return max(0.0, S - K) if option_type == 'call' else max(0.0, K - S)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if option_type == "call":
+        return S * stats.norm.cdf(d1) - K * np.exp(-r * T) * stats.norm.cdf(d2)
+    else:
+        return K * np.exp(-r * T) * stats.norm.cdf(-d2) - S * stats.norm.cdf(-d1)
+
 # --- 3. UI & DASHBOARD SETUP ---
 st.sidebar.header("🕹️ Quantitative Engine")
 ticker = st.sidebar.text_input("Ticker Symbol:", value="AAPL").upper()
+risk_free_rate = st.sidebar.number_input("Risk-Free Rate (for Options):", value=0.045, step=0.005, format="%.3f")
 lookback = st.sidebar.slider("Lookback Window:", 10, 60, 30)
 epochs = st.sidebar.slider("Training Epochs:", 10, 100, 30)
 batch_size = st.sidebar.selectbox("Batch Size:", [32, 64, 128], index=1)
@@ -158,14 +167,18 @@ if df is not None:
     st.markdown(f"**Sector:** {info.get('sector', 'N/A')} | **Industry:** {info.get('industry', 'N/A')} | **Market Cap:** {safe_get(info, 'marketCap', format_type='curr')}")
     st.markdown(f"*Compute Device: {device.type.upper()}*")
     
-    tab1, tab2, tab3 = st.tabs(["📈 Technicals & Forecast", "💎 Deep Value", "🔍 DuPont Analysis"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📈 Technicals & Forecast", 
+        "💎 Deep Value", 
+        "🔍 DuPont Analysis", 
+        "⚖️ Options & Volatility"
+    ])
 
     # ==========================================
     # TAB 1: TECHNICALS & FORECAST
     # ==========================================
     with tab1:
         st.subheader("Historical Price Action")
-        
         actual_window = min(fib_window, len(df))
         fib_df = df.tail(actual_window)
         max_price = fib_df['High'].max()
@@ -175,13 +188,10 @@ if df is not None:
         
         diff = max_price - min_price
         fib_levels = {
-            "0.0% (Low Wick)": min_price,
-            "23.6%": max_price - 0.236 * diff,
-            "38.2%": max_price - 0.382 * diff,
-            "50.0%": max_price - 0.5 * diff,
-            "61.8%": max_price - 0.618 * diff,
-            "78.6%": max_price - 0.786 * diff,
-            "100.0% (High Wick)": max_price
+            "0.0%": min_price, "23.6%": max_price - 0.236 * diff,
+            "38.2%": max_price - 0.382 * diff, "50.0%": max_price - 0.5 * diff,
+            "61.8%": max_price - 0.618 * diff, "78.6%": max_price - 0.786 * diff,
+            "100.0%": max_price
         }
 
         fig_hist = go.Figure()
@@ -194,14 +204,9 @@ if df is not None:
         colors = ["#ff9999", "#ffcc99", "#ffff99", "#ccff99", "#99ff99", "#99ccff", "#cc99ff"]
         for (level_name, price), color in zip(fib_levels.items(), colors):
             fig_hist.add_trace(go.Scatter(
-                x=[start_date, end_date], 
-                y=[price, price], 
-                mode="lines+text",
-                name=f"Fib {level_name}",
-                line=dict(color=color, dash="dot"),
-                text=[None, f"{level_name}"],
-                textposition="top left",
-                showlegend=False
+                x=[start_date, end_date], y=[price, price], mode="lines+text",
+                name=f"Fib {level_name}", line=dict(color=color, dash="dot"),
+                text=[None, f"{level_name}"], textposition="top left", showlegend=False
             ))
 
         fig_hist.update_layout(template="plotly_dark", height=600, margin=dict(l=0, r=0, t=30, b=0))
@@ -216,7 +221,7 @@ if df is not None:
             strat_rets_ai_all, strat_rets_ma_all = [], []
             last_train_df, last_test_df = None, None
 
-            with st.status("Training CNN-LSTM Attention Model (Strict No-Leakage Policy)...", expanded=True) as status:
+            with st.status("Training CNN-LSTM Attention Model...", expanded=True) as status:
                 for i, (train_idx, test_idx) in enumerate(tscv.split(df)):
                     train_df, test_df = df.iloc[train_idx], df.iloc[test_idx]
                     if i == n_splits - 1: last_train_df, last_test_df = train_df, test_df
@@ -254,7 +259,6 @@ if df is not None:
                         y_pred_ai = sc_y.inverse_transform(y_pred_scaled).flatten()
                         y_actual = sc_y.inverse_transform(y_test.numpy()).flatten()
                         
-                        # Align MA signals
                         ma_signals = np.where(test_df['SMA_20'].iloc[lookback:].values > test_df['SMA_50'].iloc[lookback:].values, 1, -1)
                         min_len = min(len(y_actual), len(ma_signals))
                         y_actual, y_pred_ai, ma_signals = y_actual[:min_len], y_pred_ai[:min_len], ma_signals[:min_len]
@@ -272,7 +276,6 @@ if df is not None:
                         sharpe_ai = (np.mean(ai_rets) / (np.std(ai_rets) + 1e-9)) * np.sqrt(252)
                         st.write(f"✅ Fold {i+1} Validated | OOS Sharpe Ratio: **{sharpe_ai:.2f}**")
                 
-                # --- PRODUCTION MODEL & FORECAST ---
                 st.write("🌐 Training Final Production Model on Full Dataset...")
                 prod_model = HybridQuantModel(len(features)).to(device)
                 opt_f = torch.optim.AdamW(prod_model.parameters(), lr=0.001)
@@ -302,7 +305,6 @@ if df is not None:
                 recent_rets = list(df['Log_Ret'].tail(max(20, lookback)).values)
                 
                 for _ in range(h_days):
-                    # Scale current window for inference
                     win_scaled = sc_x_f.transform(current_win_unscaled)
                     win_t = torch.FloatTensor(win_scaled).unsqueeze(0).to(device)
                     
@@ -311,7 +313,7 @@ if df is not None:
                         p_ret = sc_y_f.inverse_transform([[pred_scaled]])[0][0]
                     
                     if forecast_horizon == '1 Year':
-                        p_ret = p_ret * 0.95 # Autoregressive dampening
+                        p_ret = p_ret * 0.95 
                     
                     next_price = forecast_prices[-1] * np.exp(p_ret)
                     forecast_prices.append(next_price)
@@ -324,15 +326,12 @@ if df is not None:
                     
                     new_vol = np.std(recent_rets[-20:])
                     new_rsi = calculate_rsi(pd.Series(recent_prices[-15:]), 14).iloc[-1]
-                    
                     new_row = np.array([p_ret, new_vol, new_rsi])
-                    # Shift unscaled window
                     current_win_unscaled = np.append(current_win_unscaled[1:], [new_row], axis=0)
 
                 status.update(label="Validation & Forecasting Complete!", state="complete")
 
-            # --- TRAIN / TEST / FORECAST PLOT ---
-            st.subheader(f"🔮 AI Price Forecast ({forecast_horizon}) & Final Fold OOS Check")
+            st.subheader(f"🔮 AI Price Forecast ({forecast_horizon})")
             fig_f = go.Figure()
             fig_f.add_trace(go.Scatter(x=last_train_df['Date'], y=last_train_df['Close'], name="Train Data", line=dict(color="#1f77b4")))
             fig_f.add_trace(go.Scatter(x=last_test_df['Date'], y=last_test_df['Close'], name="Test Data (OOS)", line=dict(color="#ff7f0e")))
@@ -340,136 +339,126 @@ if df is not None:
             fig_f.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=30, b=0))
             st.plotly_chart(fig_f, use_container_width=True)
 
-            # --- FORECAST ACCURACY ---
-            st.subheader("🎯 Out-of-Sample Accuracy: Advanced DL vs Moving Average Baseline")
+            col1, col2 = st.columns(2)
             y_act_dir = (np.array(y_actual_all) > 0).astype(int)
             y_pred_ai_dir = (np.array(y_pred_ai_all) > 0).astype(int)
             y_pred_ma_dir = (np.array(y_pred_ma_all) > 0).astype(int)
 
-            f1_ai = f1_score(y_act_dir, y_pred_ai_dir)
-            f1_ma = f1_score(y_act_dir, y_pred_ma_dir)
-            cum_ret_ai = np.sum(strat_rets_ai_all) * 100
-            cum_ret_ma = np.sum(strat_rets_ma_all) * 100
-            dd_ai = calculate_max_drawdown(strat_rets_ai_all)
-            dd_ma = calculate_max_drawdown(strat_rets_ma_all)
-
-            col1, col2 = st.columns(2)
             with col1:
-                st.markdown("### 🤖 CNN-LSTM Attention Model")
-                st.metric("Directional F1-Score", f"{f1_ai:.4f}")
-                st.metric("Cumulative OOS Return", f"{cum_ret_ai:.2f}%")
-                st.metric("Maximum Drawdown", f"{dd_ai:.2f}%")
-                st.metric("RMSE (Log Ret)", f"{np.sqrt(mean_squared_error(y_actual_all, y_pred_ai_all)):.4f}")
-                
+                st.markdown("### 🤖 CNN-LSTM Model Stats")
+                st.metric("Directional F1", f"{f1_score(y_act_dir, y_pred_ai_dir):.4f}")
+                st.metric("Cumulative Return", f"{np.sum(strat_rets_ai_all)*100:.2f}%")
             with col2:
                 st.markdown("### 📊 Baseline (20/50 SMA)")
-                st.metric("Directional F1-Score", f"{f1_ma:.4f}", delta=f"{f1_ma - f1_ai:.4f} vs AI", delta_color="normal")
-                st.metric("Cumulative OOS Return", f"{cum_ret_ma:.2f}%", delta=f"{cum_ret_ma - cum_ret_ai:.2f}% vs AI", delta_color="normal")
-                st.metric("Maximum Drawdown", f"{dd_ma:.2f}%", delta=f"{dd_ma - dd_ai:.2f}% vs AI", delta_color="inverse")
-                st.metric("RMSE (Log Ret)", "N/A")
-
-            # --- FEATURE IMPORTANCE ---
-            st.subheader("🧠 Permutation Feature Importance (Spatial)")
-            importances = []
-            with torch.no_grad():
-                X_test_dev = X_test.to(device)
-                baseline_loss = nn.HuberLoss()(model(X_test_dev), y_test.to(device)).item()
-                for f_idx in range(len(features)):
-                    X_temp = X_test_dev.clone()
-                    X_temp[:, :, f_idx] = X_temp[torch.randperm(X_temp.size(0)), :, f_idx]
-                    shuffled_loss = nn.HuberLoss()(model(X_temp), y_test.to(device)).item()
-                    importances.append(max(0, shuffled_loss - baseline_loss))
-            
-            imp_df = pd.DataFrame({'Feature': features, 'Impact': importances}).sort_values(by='Impact', ascending=True)
-            fig_imp = px.bar(imp_df, x='Impact', y='Feature', orientation='h', template="plotly_dark", title="Loss Increase When Feature is Shuffled")
-            st.plotly_chart(fig_imp, use_container_width=True)
+                st.metric("Directional F1", f"{f1_score(y_act_dir, y_pred_ma_dir):.4f}")
+                st.metric("Cumulative Return", f"{np.sum(strat_rets_ma_all)*100:.2f}%")
 
     # ==========================================
     # TAB 2: DEEP VALUE METRICS
     # ==========================================
     with tab2:
-        st.subheader("💎 20 Deep Value & Solvency Metrics")
-        eps_val = info.get('trailingEps')
-        bvps_val = info.get('bookValue')
-        if eps_val and bvps_val and eps_val > 0 and bvps_val > 0:
-            graham_num = np.sqrt(22.5 * eps_val * bvps_val)
-            graham_val_str = f"${graham_num:.2f}"
-        else:
-            graham_val_str = "N/A"
-
-        metrics_data = [
-            ("P/E Ratio", safe_get(info, 'trailingPE', format_type='float'), r"\frac{\text{Market Price}}{\text{Trailing EPS}}", "TTM"),
-            ("Forward P/E", safe_get(info, 'forwardPE', format_type='float'), r"\frac{\text{Market Price}}{\text{Estimated Future EPS}}", "Next 12M"),
-            ("PEG Ratio", safe_get(info, 'pegRatio', format_type='float'), r"\frac{\text{P/E Ratio}}{\text{Earnings Growth Rate}}", "5Y Expected"),
-            ("Graham Number", graham_val_str, r"\sqrt{22.5 \times \text{EPS} \times \text{BVPS}}", "TTM/MRQ"),
-            ("Price to Book (P/B)", safe_get(info, 'priceToBook', format_type='float'), r"\frac{\text{Market Price}}{\text{Book Value per Share}}", "MRQ"),
-            ("Price to Sales (P/S)", safe_get(info, 'priceToSalesTrailing12Months', format_type='float'), r"\frac{\text{Market Cap}}{\text{Total Revenue}}", "TTM"),
-            ("EV to EBITDA", safe_get(info, 'enterpriseToEbitda', format_type='float'), r"\frac{\text{Enterprise Value}}{\text{EBITDA}}", "TTM"),
-            ("EV to Revenue", safe_get(info, 'enterpriseToRevenue', format_type='float'), r"\frac{\text{Enterprise Value}}{\text{Revenue}}", "TTM"),
-            ("Dividend Yield", safe_get(info, 'dividendYield', format_type='pct'), r"\frac{\text{Annual Dividends per Share}}{\text{Price per Share}}", "Forward"),
-            ("Payout Ratio", safe_get(info, 'payoutRatio', format_type='pct'), r"\frac{\text{Dividends Paid}}{\text{Net Income}}", "TTM"),
-            ("Current Ratio", safe_get(info, 'currentRatio', format_type='float'), r"\frac{\text{Current Assets}}{\text{Current Liabilities}}", "MRQ"),
-            ("Quick Ratio", safe_get(info, 'quickRatio', format_type='float'), r"\frac{\text{Current Assets} - \text{Inventory}}{\text{Current Liabilities}}", "MRQ"),
-            ("Debt to Equity", safe_get(info, 'debtToEquity', format_type='float'), r"\frac{\text{Total Liabilities}}{\text{Shareholders' Equity}}", "MRQ"),
-            ("Return on Equity (ROE)", safe_get(info, 'returnOnEquity', format_type='pct'), r"\frac{\text{Net Income}}{\text{Shareholders' Equity}}", "TTM"),
-            ("Return on Assets (ROA)", safe_get(info, 'returnOnAssets', format_type='pct'), r"\frac{\text{Net Income}}{\text{Total Assets}}", "TTM"),
-            ("Gross Margin", safe_get(info, 'grossMargins', format_type='pct'), r"\frac{\text{Revenue} - \text{COGS}}{\text{Revenue}}", "TTM"),
-            ("Operating Margin", safe_get(info, 'operatingMargins', format_type='pct'), r"\frac{\text{Operating Income}}{\text{Revenue}}", "TTM"),
+        st.subheader("💎 Key Fundamental Metrics")
+        metrics = [
+            ("P/E Ratio", safe_get(info, 'trailingPE', format_type='float')),
+            ("Forward P/E", safe_get(info, 'forwardPE', format_type='float')),
+            ("Price to Book (P/B)", safe_get(info, 'priceToBook', format_type='float')),
+            ("EV to EBITDA", safe_get(info, 'enterpriseToEbitda', format_type='float')),
+            ("Debt to Equity", safe_get(info, 'debtToEquity', format_type='float')),
+            ("Return on Equity (ROE)", safe_get(info, 'returnOnEquity', format_type='pct')),
         ]
-
-        formatted_metrics = []
-        for name, val, formula, period in metrics_data:
-            formatted_metrics.append((name, val, formula, period))
-
-        for i in range(0, len(formatted_metrics), 2):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"**{formatted_metrics[i][0]}** | Period: *{formatted_metrics[i][3]}*")
-                st.latex(formatted_metrics[i][2])
-                st.markdown(f"> **Value: {formatted_metrics[i][1]}**")
-                st.divider()
-            if i + 1 < len(formatted_metrics):
-                with col2:
-                    st.markdown(f"**{formatted_metrics[i+1][0]}** | Period: *{formatted_metrics[i+1][3]}*")
-                    st.latex(formatted_metrics[i+1][2])
-                    st.markdown(f"> **Value: {formatted_metrics[i+1][1]}**")
-                    st.divider()
+        col1, col2, col3 = st.columns(3)
+        for i, (name, val) in enumerate(metrics):
+            if i % 3 == 0: col1.metric(name, val)
+            elif i % 3 == 1: col2.metric(name, val)
+            else: col3.metric(name, val)
 
     # ==========================================
     # TAB 3: DUPONT ANALYSIS
     # ==========================================
     with tab3:
+        st.subheader("🔍 DuPont Analysis")
+        st.latex(r"ROE = \text{Net Profit Margin} \times \text{Asset Turnover} \times \text{Equity Multiplier}")
         
-        st.subheader("🔍 3-Step DuPont Analysis")
-        st.latex(r"ROE = \left( \frac{\text{Net Income}}{\text{Sales}} \right) \times \left( \frac{\text{Sales}}{\text{Total Assets}} \right) \times \left( \frac{\text{Total Assets}}{\text{Total Equity}} \right)")
+        net_income = get_financial_metric(ic, ['Net Income', 'Net Income Common Stockholders'])
+        revenue = get_financial_metric(ic, ['Total Revenue', 'Operating Revenue'])
+        total_assets = get_financial_metric(bs, ['Total Assets'])
+        total_equity = get_financial_metric(bs, ['Stockholders Equity', 'Total Stockholder Equity'])
         
-        try:
-            net_income_keys = ['Net Income', 'Net Income Common Stockholders']
-            revenue_keys = ['Total Revenue', 'Operating Revenue']
-            assets_keys = ['Total Assets']
-            equity_keys = ['Stockholders Equity', 'Total Stockholder Equity', 'Common Stock Equity']
+        if all([net_income, revenue, total_assets, total_equity]):
+            npm = net_income / revenue
+            ato = revenue / total_assets
+            em = total_assets / total_equity
             
-            net_income = get_financial_metric(ic, net_income_keys)
-            revenue = get_financial_metric(ic, revenue_keys)
-            total_assets = get_financial_metric(bs, assets_keys)
-            total_equity = get_financial_metric(bs, equity_keys)
-            
-            if all([net_income, revenue, total_assets, total_equity]):
-                npm = net_income / revenue
-                ato = revenue / total_assets
-                em = total_assets / total_equity
-                calculated_roe = npm * ato * em
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Net Profit Margin", f"{npm*100:.2f}%")
+            c2.metric("Asset Turnover", f"{ato:.2f}x")
+            c3.metric("Equity Multiplier", f"{em:.2f}x")
+            c4.metric("Calculated ROE", f"{npm * ato * em * 100:.2f}%")
+        else:
+            st.warning("Insufficient fundamental data available for this ticker.")
 
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Net Profit Margin", f"{npm*100:.2f}%")
-                col2.metric("Asset Turnover", f"{ato:.2f}x")
-                col3.metric("Equity Multiplier (Leverage)", f"{em:.2f}x")
-                col4.metric("Calculated ROE", f"{calculated_roe*100:.2f}%", delta="DuPont Result")
+    # ==========================================
+    # TAB 4: OPTIONS & VOLATILITY
+    # ==========================================
+    with tab4:
+        st.subheader("⚖️ Volatility Surface & Actionable Strategies")
+        exps, calls, puts = get_options_data(ticker)
+        
+        if exps is None:
+            st.warning("No options data available for this ticker.")
+        else:
+            current_price = df['Close'].iloc[-1]
+            hv_30 = df['Log_Ret'].tail(30).std() * np.sqrt(252)
+            
+            atm_calls = calls[(calls['strike'] >= current_price * 0.95) & (calls['strike'] <= current_price * 1.05)]
+            atm_puts = puts[(puts['strike'] >= current_price * 0.95) & (puts['strike'] <= current_price * 1.05)]
+            blended_iv = (atm_calls['impliedVolatility'].mean() + atm_puts['impliedVolatility'].mean()) / 2
+            vol_premium = blended_iv - hv_30
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("30-Day Historical Volatility (HV)", f"{hv_30*100:.2f}%")
+            c2.metric("Front-Month Implied Volatility (IV)", f"{blended_iv*100:.2f}%")
+            c3.metric("Volatility Premium (IV - HV)", f"{vol_premium*100:.2f}%")
+
+            st.divider()
+            
+            st.subheader("📐 Black-Scholes Theoretical Pricing (ATM Calls)")
+            st.latex(r"C = S \cdot N(d_1) - K \cdot e^{-rt} \cdot N(d_2)")
+            
+            # Calculate Time to Expiration in Years
+            exp_date = datetime.strptime(exps[0], "%Y-%m-%d")
+            dte = (exp_date - datetime.now()).days
+            time_to_exp_years = dte / 365.25
+            
+            if not atm_calls.empty and time_to_exp_years > 0:
+                atm_calls['Theoretical_Price'] = atm_calls.apply(
+                    lambda row: black_scholes_price(current_price, row['strike'], time_to_exp_years, risk_free_rate, row['impliedVolatility'], 'call'), axis=1
+                )
+                atm_calls['Mispricing_%'] = ((atm_calls['lastPrice'] - atm_calls['Theoretical_Price']) / atm_calls['Theoretical_Price']) * 100
                 
-                st.info("💡 **Interpretation:** High ROE driven by Net Profit Margin is highly desirable (pricing power). If driven mostly by the Equity Multiplier, the company relies heavily on debt.")
+                disp_cols = ['contractSymbol', 'strike', 'lastPrice', 'impliedVolatility', 'Theoretical_Price', 'Mispricing_%']
+                st.dataframe(atm_calls[disp_cols].style.format({
+                    'strike': '${:.2f}', 'lastPrice': '${:.2f}', 'Theoretical_Price': '${:.2f}',
+                    'impliedVolatility': '{:.2%}', 'Mispricing_%': '{:+.2f}%'
+                }), use_container_width=True)
             else:
-                st.warning("Insufficient balance sheet or income statement data available for this ticker.")
-        except Exception:
-            st.error("Error calculating manual DuPont breakdown.")
+                st.info("Options expire today or not enough ATM liquidity for theoretical pricing.")
+
+            st.divider()
+
+            current_sma20, current_sma50, current_rsi = df['SMA_20'].iloc[-1], df['SMA_50'].iloc[-1], df['RSI'].iloc[-1]
+            trend = "Bullish" if current_sma20 > current_sma50 else "Bearish"
+            momentum = "Overbought" if current_rsi > 70 else "Oversold" if current_rsi < 30 else "Neutral"
+
+            st.subheader(f"🤖 Algorithmic Strategy ({trend} / {momentum})")
+            
+            if vol_premium > 0.05:
+                strat = "Bull Put Spread" if trend == "Bullish" and current_rsi < 70 else "Bear Call Spread" if trend == "Bearish" and current_rsi > 30 else "Iron Condor"
+            elif vol_premium < -0.02:
+                strat = "Long Call Spread" if trend == "Bullish" and current_rsi < 70 else "Long Put Spread" if trend == "Bearish" and current_rsi > 30 else "Long Straddle"
+            else:
+                strat = "Covered Call" if trend == "Bullish" else "Cash Secured Put"
+
+            st.success(f"**Recommended Action:** {strat}")
 else:
-    st.error("Ticker not found. Please check the symbol.")
+    st.error("Ticker not found.")
