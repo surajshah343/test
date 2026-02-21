@@ -184,19 +184,16 @@ if df is not None:
                     
                     model.eval()
                     with torch.no_grad():
-                        # AI Predictions
                         y_pred_scaled = model(X_test).numpy()
                         y_pred_ai = sc_y.inverse_transform(y_pred_scaled).flatten()
                         y_actual = sc_y.inverse_transform(y_test.numpy()).flatten()
                         
-                        # Baseline Predictions (MA Crossover)
                         ma_signals = np.where(test_df['SMA_20'].iloc[lookback-1:-1].values > test_df['SMA_50'].iloc[lookback-1:-1].values, 1, 0)
                         
                         y_actual_all.extend(y_actual)
                         y_pred_ai_all.extend(y_pred_ai)
                         y_pred_ma_all.extend(ma_signals)
                         
-                        # Strategy Returns calculation
                         ai_rets = np.where(y_pred_ai > 0, 1, 0) * y_actual
                         ma_rets = ma_signals * y_actual
                         
@@ -229,19 +226,37 @@ if df is not None:
                 
                 h_days = {'1 Week': 5, '1 Month': 21, '1 Year': 252}[forecast_horizon]
                 
+                # FIX: Maintain active lists of recent valid prices/returns to accurately compute features
+                recent_prices = list(df['Close'].tail(max(20, lookback)).values)
+                recent_rets = list(df['Log_Ret'].tail(max(20, lookback)).values)
+                
                 for _ in range(h_days):
                     win_t = torch.FloatTensor(sc_x_f.transform(current_win)).unsqueeze(0)
                     with torch.no_grad():
                         p_ret = sc_y_f.inverse_transform([[prod_model(win_t).item()]])[0][0]
                     
-                    forecast_prices.append(forecast_prices[-1] * np.exp(p_ret))
+                    # Apply a slight autoregressive dampening factor for longer horizons to prevent runaway compounding errors
+                    if forecast_horizon == '1 Year':
+                        p_ret = p_ret * 0.90
+                    
+                    next_price = forecast_prices[-1] * np.exp(p_ret)
+                    forecast_prices.append(next_price)
+                    
+                    # Update active lists
+                    recent_prices.append(next_price)
+                    recent_rets.append(p_ret)
+                    
                     # Add business day
                     next_date = forecast_dates[-1] + timedelta(days=1)
                     while next_date.weekday() >= 5:
                         next_date += timedelta(days=1)
                     forecast_dates.append(next_date)
                     
-                    new_row = np.array([p_ret, np.std(np.append(current_win[:, 0], p_ret)[-20:]), calculate_rsi(pd.Series(np.append(current_win[:, 0], p_ret)), 14).iloc[-1]])
+                    # FIX: Correctly calculate Volatility and RSI on the dynamically built arrays
+                    new_vol = np.std(recent_rets[-20:])
+                    new_rsi = calculate_rsi(pd.Series(recent_prices[-15:]), 14).iloc[-1]
+                    
+                    new_row = np.array([p_ret, new_vol, new_rsi])
                     current_win = np.append(current_win[1:], [new_row], axis=0)
 
                 status.update(label="Validation & Forecasting Complete!", state="complete")
@@ -249,11 +264,8 @@ if df is not None:
             # --- TRAIN / TEST / FORECAST PLOT ---
             st.subheader(f"🔮 AI Price Forecast ({forecast_horizon}) & Fold Evaluation Split")
             fig_f = go.Figure()
-            # Plot last fold train
             fig_f.add_trace(go.Scatter(x=last_train_df['Date'], y=last_train_df['Close'], name="Train Data (Last Fold)", line=dict(color="#1f77b4")))
-            # Plot last fold test
             fig_f.add_trace(go.Scatter(x=last_test_df['Date'], y=last_test_df['Close'], name="Test Data (OOS)", line=dict(color="#ff7f0e")))
-            # Plot Forecast
             fig_f.add_trace(go.Scatter(x=forecast_dates, y=forecast_prices, name="AI Forecast", line=dict(color="#2ca02c", width=3, dash="dash")))
             
             fig_f.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=30, b=0))
@@ -298,13 +310,23 @@ if df is not None:
     # TAB 2: DEEP VALUE METRICS
     # ==========================================
     with tab2:
-        st.subheader("💎 19 Deep Value & Solvency Metrics")
+        st.subheader("💎 20 Deep Value & Solvency Metrics")
         st.markdown("Statistically driven fundamental breakdown using the TTM (Trailing Twelve Months) or MRQ (Most Recent Quarter) periods.")
         
+        # Calculate Graham Number
+        eps_val = info.get('trailingEps')
+        bvps_val = info.get('bookValue')
+        if eps_val and bvps_val and eps_val > 0 and bvps_val > 0:
+            graham_num = np.sqrt(22.5 * eps_val * bvps_val)
+            graham_val_str = f"${graham_num:.2f}"
+        else:
+            graham_val_str = "N/A"
+
         metrics_data = [
             ("P/E Ratio", safe_get(info, 'trailingPE', format_type='float'), r"\frac{\text{Market Price}}{\text{Trailing EPS}}", "TTM"),
             ("Forward P/E", safe_get(info, 'forwardPE', format_type='float'), r"\frac{\text{Market Price}}{\text{Estimated Future EPS}}", "Next 12M"),
             ("PEG Ratio", safe_get(info, 'pegRatio', format_type='float'), r"\frac{\text{P/E Ratio}}{\text{Earnings Growth Rate}}", "5Y Expected"),
+            ("Graham Number", graham_val_str, r"\sqrt{22.5 \times \text{EPS} \times \text{BVPS}}", "TTM/MRQ"),
             ("Price to Book (P/B)", safe_get(info, 'priceToBook', format_type='float'), r"\frac{\text{Market Price}}{\text{Book Value per Share}}", "MRQ"),
             ("Price to Sales (P/S)", safe_get(info, 'priceToSalesTrailing12Months', format_type='float'), r"\frac{\text{Market Cap}}{\text{Total Revenue}}", "TTM"),
             ("EV to EBITDA", safe_get(info, 'enterpriseToEbitda', format_type='float'), r"\frac{\text{Enterprise Value}}{\text{EBITDA}}", "TTM"),
@@ -315,7 +337,7 @@ if df is not None:
             ("Free Cash Flow Yield", safe_get(info, 'freeCashflow') / safe_get(info, 'marketCap', default=1) if safe_get(info, 'freeCashflow') not in [None, "N/A"] else "N/A", r"\frac{\text{Free Cash Flow}}{\text{Market Cap}}", "TTM"),
             ("Current Ratio", safe_get(info, 'currentRatio', format_type='float'), r"\frac{\text{Current Assets}}{\text{Current Liabilities}}", "MRQ"),
             ("Quick Ratio", safe_get(info, 'quickRatio', format_type='float'), r"\frac{\text{Current Assets} - \text{Inventory}}{\text{Current Liabilities}}", "MRQ"),
-            ("Cash Ratio", safe_get(info, 'totalCash') / safe_get(info, 'totalDebt', default=1) if safe_get(info, 'totalCash') not in [None, "N/A"] else "N/A", r"\frac{\text{Cash & Equivalents}}{\text{Current Liabilities}}", "MRQ"),
+            ("Cash Ratio", safe_get(info, 'totalCash') / safe_get(info, 'totalDebt', default=1) if safe_get(info, 'totalCash') not in [None, "N/A"] else "N/A", r"\frac{\text{Cash \& Equivalents}}{\text{Current Liabilities}}", "MRQ"),
             ("Debt to Equity", safe_get(info, 'debtToEquity', format_type='float'), r"\frac{\text{Total Liabilities}}{\text{Shareholders' Equity}}", "MRQ"),
             ("Return on Equity (ROE)", safe_get(info, 'returnOnEquity', format_type='pct'), r"\frac{\text{Net Income}}{\text{Shareholders' Equity}}", "TTM"),
             ("Return on Assets (ROA)", safe_get(info, 'returnOnAssets', format_type='pct'), r"\frac{\text{Net Income}}{\text{Total Assets}}", "TTM"),
@@ -323,7 +345,6 @@ if df is not None:
             ("Operating Margin", safe_get(info, 'operatingMargins', format_type='pct'), r"\frac{\text{Operating Income}}{\text{Revenue}}", "TTM"),
         ]
 
-        # Formatting floats for newly calculated metrics
         formatted_metrics = []
         for name, val, formula, period in metrics_data:
             if isinstance(val, (float, np.float64)) and name in ["EV to Free Cash Flow", "Cash Ratio"]:
