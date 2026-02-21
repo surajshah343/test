@@ -67,7 +67,7 @@ def calculate_rsi(series, window=14):
 @st.cache_data(ttl=3600)
 def load_and_process(symbol):
     # Requirement: Start data 10 years from 2015
-    df = yf.download(symbol, start="2015-01-01", interval="1d", progress=False)
+    df = yf.download(symbol, start="2018-01-01", interval="1d", progress=False)
     if df.empty: return None
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df = df.reset_index()
