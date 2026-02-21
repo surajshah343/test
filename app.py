@@ -358,19 +358,47 @@ if df is not None:
     # ==========================================
     with tab2:
         st.subheader("💎 Key Fundamental Metrics")
-        metrics = [
-            ("P/E Ratio", safe_get(info, 'trailingPE', format_type='float')),
-            ("Forward P/E", safe_get(info, 'forwardPE', format_type='float')),
-            ("Price to Book (P/B)", safe_get(info, 'priceToBook', format_type='float')),
-            ("EV to EBITDA", safe_get(info, 'enterpriseToEbitda', format_type='float')),
-            ("Debt to Equity", safe_get(info, 'debtToEquity', format_type='float')),
-            ("Return on Equity (ROE)", safe_get(info, 'returnOnEquity', format_type='pct')),
+        
+        # Today's date for reference
+        pull_date = datetime.now().strftime("%Y-%m-%d")
+        
+        # Calculate Graham Number if EPS and BVPS are available
+        eps = info.get('trailingEps', 0)
+        bvps = info.get('bookValue', 0)
+        
+        if eps and bvps and eps > 0 and bvps > 0:
+            graham_val = np.sqrt(22.5 * eps * bvps)
+            graham_number_display = f"${graham_val:.2f}"
+        else:
+            graham_number_display = "N/A"
+
+        # Constructing the metrics dataset
+        metrics_data = [
+            {"Metric": "P/E Ratio", "Value": safe_get(info, 'trailingPE', format_type='float'), "Formula": "Price / Trailing EPS", "Date Pulled": pull_date},
+            {"Metric": "Forward P/E", "Value": safe_get(info, 'forwardPE', format_type='float'), "Formula": "Price / Forward EPS", "Date Pulled": pull_date},
+            {"Metric": "Price to Book (P/B)", "Value": safe_get(info, 'priceToBook', format_type='float'), "Formula": "Price / Book Value per Share", "Date Pulled": pull_date},
+            {"Metric": "Price to Sales (P/S)", "Value": safe_get(info, 'priceToSalesTrailing12Months', format_type='float'), "Formula": "Price / Sales per Share", "Date Pulled": pull_date},
+            {"Metric": "PEG Ratio", "Value": safe_get(info, 'pegRatio', format_type='float'), "Formula": "P/E Ratio / Earnings Growth Rate", "Date Pulled": pull_date},
+            {"Metric": "EV to EBITDA", "Value": safe_get(info, 'enterpriseToEbitda', format_type='float'), "Formula": "Enterprise Value / EBITDA", "Date Pulled": pull_date},
+            {"Metric": "EV to Revenue", "Value": safe_get(info, 'enterpriseToRevenue', format_type='float'), "Formula": "Enterprise Value / Revenue", "Date Pulled": pull_date},
+            {"Metric": "Debt to Equity", "Value": safe_get(info, 'debtToEquity', format_type='float'), "Formula": "Total Debt / Total Equity", "Date Pulled": pull_date},
+            {"Metric": "Current Ratio", "Value": safe_get(info, 'currentRatio', format_type='float'), "Formula": "Current Assets / Current Liabilities", "Date Pulled": pull_date},
+            {"Metric": "Quick Ratio", "Value": safe_get(info, 'quickRatio', format_type='float'), "Formula": "(Current Assets - Inventory) / Current Liabilities", "Date Pulled": pull_date},
+            {"Metric": "Return on Equity (ROE)", "Value": safe_get(info, 'returnOnEquity', format_type='pct'), "Formula": "Net Income / Shareholder's Equity", "Date Pulled": pull_date},
+            {"Metric": "Return on Assets (ROA)", "Value": safe_get(info, 'returnOnAssets', format_type='pct'), "Formula": "Net Income / Total Assets", "Date Pulled": pull_date},
+            {"Metric": "Gross Margin", "Value": safe_get(info, 'grossMargins', format_type='pct'), "Formula": "Gross Profit / Revenue", "Date Pulled": pull_date},
+            {"Metric": "Operating Margin", "Value": safe_get(info, 'operatingMargins', format_type='pct'), "Formula": "Operating Income / Revenue", "Date Pulled": pull_date},
+            {"Metric": "Net Profit Margin", "Value": safe_get(info, 'profitMargins', format_type='pct'), "Formula": "Net Income / Revenue", "Date Pulled": pull_date},
+            {"Metric": "Dividend Yield", "Value": safe_get(info, 'dividendYield', format_type='pct'), "Formula": "Annual Dividends per Share / Price", "Date Pulled": pull_date},
+            {"Metric": "Payout Ratio", "Value": safe_get(info, 'payoutRatio', format_type='pct'), "Formula": "Dividends / Net Income", "Date Pulled": pull_date},
+            {"Metric": "Trailing EPS", "Value": safe_get(info, 'trailingEps', format_type='curr'), "Formula": "Net Income / Outstanding Shares", "Date Pulled": pull_date},
+            {"Metric": "Forward EPS", "Value": safe_get(info, 'forwardEps', format_type='curr'), "Formula": "Estimated Net Income / Outstanding Shares", "Date Pulled": pull_date},
+            {"Metric": "Book Value Per Share", "Value": safe_get(info, 'bookValue', format_type='curr'), "Formula": "Total Equity / Outstanding Shares", "Date Pulled": pull_date},
+            {"Metric": "Graham Number", "Value": graham_number_display, "Formula": "sqrt(22.5 * EPS * BVPS)", "Date Pulled": pull_date},
         ]
-        col1, col2, col3 = st.columns(3)
-        for i, (name, val) in enumerate(metrics):
-            if i % 3 == 0: col1.metric(name, val)
-            elif i % 3 == 1: col2.metric(name, val)
-            else: col3.metric(name, val)
+        
+        metrics_df = pd.DataFrame(metrics_data)
+        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
     # ==========================================
     # TAB 3: DUPONT ANALYSIS
@@ -461,7 +489,7 @@ if df is not None:
 
             st.success(f"**Recommended Action:** {strat}")
             
-            # NEW: Strike Recommendation Logic added here
+            # Strike Recommendation Logic
             if time_to_exp_years > 0:
                 expected_move = current_price * blended_iv * np.sqrt(time_to_exp_years)
                 upper_1sd = current_price + expected_move
