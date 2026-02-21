@@ -103,6 +103,7 @@ ticker = st.sidebar.text_input("Ticker Symbol:", value="AAPL").upper()
 lookback = st.sidebar.slider("Lookback Window:", 10, 60, 30)
 epochs = st.sidebar.slider("Training Epochs:", 5, 50, 20)
 n_splits = st.sidebar.slider("TSCV Folds:", 2, 5, 3)
+forecast_horizon = st.sidebar.selectbox("Forecast Horizon:", ["1 Week", "1 Month", "1 Year"])
 
 df = load_and_process(ticker)
 info, bs, ic = get_fundamentals(ticker)
@@ -111,33 +112,60 @@ if df is not None:
     st.title(f"🚀 AI Quant Dashboard: {ticker}")
     st.markdown(f"**Sector:** {info.get('sector', 'N/A')} | **Industry:** {info.get('industry', 'N/A')} | **Market Cap:** {safe_get(info, 'marketCap', format_type='curr')}")
     
-    tab1, tab2, tab3 = st.tabs(["📈 Technicals, AI vs Baseline", "💎 Deep Value Metrics", "🔍 DuPont Analysis"])
+    tab1, tab2, tab3 = st.tabs(["📈 Technicals, AI vs Baseline & Forecast", "💎 Deep Value Metrics", "🔍 DuPont Analysis"])
 
     # ==========================================
     # TAB 1: TECHNICALS & FORECAST
     # ==========================================
     with tab1:
-        st.subheader("Historical Price Action with Support/Resistance & Baselines")
+        st.subheader("Historical Price Action with Support/Resistance & Fibonacci")
+        
+        # Calculate Fibonacci Retracement Levels
+        max_price = df['High'].max()
+        min_price = df['Low'].min()
+        diff = max_price - min_price
+        fib_levels = {
+            "0.0% (Low)": min_price,
+            "23.6%": max_price - 0.236 * diff,
+            "38.2%": max_price - 0.382 * diff,
+            "50.0%": max_price - 0.5 * diff,
+            "61.8%": max_price - 0.618 * diff,
+            "78.6%": max_price - 0.786 * diff,
+            "100.0% (High)": max_price
+        }
+
         fig_hist = go.Figure()
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name="Close", line=dict(color="white")))
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['SMA_20'], name="20-Day SMA", line=dict(color="cyan", width=1)))
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['SMA_50'], name="50-Day SMA", line=dict(color="orange", width=1)))
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Support_60d'], name="60d Support", line=dict(color="red", dash="dash")))
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Resistance_60d'], name="60d Resistance", line=dict(color="green", dash="dash")))
-        fig_hist.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=30, b=0))
+        
+        # Add Fibonacci Lines
+        colors = ["#ff9999", "#ffcc99", "#ffff99", "#ccff99", "#99ff99", "#99ccff", "#cc99ff"]
+        for (level_name, price), color in zip(fib_levels.items(), colors):
+            fig_hist.add_hline(y=price, line_dash="dot", line_color=color, annotation_text=level_name, annotation_position="top left")
+
+        fig_hist.update_layout(template="plotly_dark", height=600, margin=dict(l=0, r=0, t=30, b=0))
         st.plotly_chart(fig_hist, use_container_width=True)
 
-        if st.button("🔄 Run AI Model & Baseline Comparison"):
+        if st.button("🔄 Run AI Model Pipeline & Generate Forecast"):
             features = ['Log_Ret', 'Vol_20', 'RSI']
             tscv = TimeSeriesSplit(n_splits=n_splits)
             
             y_actual_all, y_pred_ai_all, y_pred_ma_all = [], [], []
             strat_rets_ai_all, strat_rets_ma_all = [], []
+            
+            last_train_df, last_test_df = None, None
 
             with st.status("Training AI & Validating Against MA Crossover (Strict No-Leakage Policy)...", expanded=True) as status:
                 for i, (train_idx, test_idx) in enumerate(tscv.split(df)):
                     train_df, test_df = df.iloc[train_idx], df.iloc[test_idx]
                     
+                    # Save last fold for visualization
+                    if i == n_splits - 1:
+                        last_train_df, last_test_df = train_df, test_df
+
                     # STRICT LEAKAGE PREVENTION: Fit scalers ONLY on training data
                     sc_x = RobustScaler().fit(train_df[features])
                     sc_y = RobustScaler().fit(train_df[['Target']])
@@ -162,13 +190,11 @@ if df is not None:
                         y_actual = sc_y.inverse_transform(y_test.numpy()).flatten()
                         
                         # Baseline Predictions (MA Crossover)
-                        # We align the index: prediction for day t+1 uses SMA states at day t.
-                        # Sequences end at lookback-1 through length-2 for predicting the next step.
                         ma_signals = np.where(test_df['SMA_20'].iloc[lookback-1:-1].values > test_df['SMA_50'].iloc[lookback-1:-1].values, 1, 0)
                         
                         y_actual_all.extend(y_actual)
                         y_pred_ai_all.extend(y_pred_ai)
-                        y_pred_ma_all.extend(ma_signals) # Storing signals as 'predictions' for hit rate calc
+                        y_pred_ma_all.extend(ma_signals)
                         
                         # Strategy Returns calculation
                         ai_rets = np.where(y_pred_ai > 0, 1, 0) * y_actual
@@ -182,21 +208,65 @@ if df is not None:
                         
                         st.write(f"✅ Fold {i+1} Validated | AI Sharpe: **{sharpe_ai:.2f}** vs MA Sharpe: **{sharpe_ma:.2f}**")
                 
-                status.update(label="Validation Complete!", state="complete")
+                # --- PRODUCTION MODEL & FORECAST ---
+                st.write("🌐 Training Final Production Model on All Data...")
+                prod_model = HybridQuantModel(len(features))
+                opt_f = torch.optim.Adam(prod_model.parameters(), lr=0.001)
+                sc_x_f = RobustScaler().fit(df[features])
+                sc_y_f = RobustScaler().fit(df[['Target']])
+                X_f, y_f = create_sequences(df, features, 'Target', sc_x_f, sc_y_f, lookback)
+                
+                for _ in range(epochs):
+                    prod_model.train()
+                    opt_f.zero_grad()
+                    nn.MSELoss()(prod_model(X_f), y_f).backward()
+                    opt_f.step()
+
+                prod_model.eval()
+                current_win = df[features].tail(lookback).values
+                forecast_prices = [df['Close'].iloc[-1]]
+                forecast_dates = [df['Date'].iloc[-1]]
+                
+                h_days = {'1 Week': 5, '1 Month': 21, '1 Year': 252}[forecast_horizon]
+                
+                for _ in range(h_days):
+                    win_t = torch.FloatTensor(sc_x_f.transform(current_win)).unsqueeze(0)
+                    with torch.no_grad():
+                        p_ret = sc_y_f.inverse_transform([[prod_model(win_t).item()]])[0][0]
+                    
+                    forecast_prices.append(forecast_prices[-1] * np.exp(p_ret))
+                    # Add business day
+                    next_date = forecast_dates[-1] + timedelta(days=1)
+                    while next_date.weekday() >= 5:
+                        next_date += timedelta(days=1)
+                    forecast_dates.append(next_date)
+                    
+                    new_row = np.array([p_ret, np.std(np.append(current_win[:, 0], p_ret)[-20:]), calculate_rsi(pd.Series(np.append(current_win[:, 0], p_ret)), 14).iloc[-1]])
+                    current_win = np.append(current_win[1:], [new_row], axis=0)
+
+                status.update(label="Validation & Forecasting Complete!", state="complete")
+
+            # --- TRAIN / TEST / FORECAST PLOT ---
+            st.subheader(f"🔮 AI Price Forecast ({forecast_horizon}) & Fold Evaluation Split")
+            fig_f = go.Figure()
+            # Plot last fold train
+            fig_f.add_trace(go.Scatter(x=last_train_df['Date'], y=last_train_df['Close'], name="Train Data (Last Fold)", line=dict(color="#1f77b4")))
+            # Plot last fold test
+            fig_f.add_trace(go.Scatter(x=last_test_df['Date'], y=last_test_df['Close'], name="Test Data (OOS)", line=dict(color="#ff7f0e")))
+            # Plot Forecast
+            fig_f.add_trace(go.Scatter(x=forecast_dates, y=forecast_prices, name="AI Forecast", line=dict(color="#2ca02c", width=3, dash="dash")))
+            
+            fig_f.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig_f, use_container_width=True)
 
             # --- FORECAST ACCURACY ---
             st.subheader("🎯 Out-of-Sample Accuracy: AI Model vs Moving Average")
-            
-            # Hit rate calculations
             hit_rate_ai = np.mean((np.array(y_pred_ai_all) > 0) == (np.array(y_actual_all) > 0)) * 100
             hit_rate_ma = np.mean(np.array(y_pred_ma_all) == (np.array(y_actual_all) > 0).astype(int)) * 100
-            
-            # Total strategy returns across all folds
             cum_ret_ai = np.sum(strat_rets_ai_all) * 100
             cum_ret_ma = np.sum(strat_rets_ma_all) * 100
 
             col1, col2 = st.columns(2)
-            
             with col1:
                 st.markdown("### 🤖 Hybrid AI Model")
                 st.metric("Directional Hit Rate", f"{hit_rate_ai:.2f}%")
@@ -228,7 +298,7 @@ if df is not None:
     # TAB 2: DEEP VALUE METRICS
     # ==========================================
     with tab2:
-        st.subheader("💎 15 Deep Value & Solvency Metrics")
+        st.subheader("💎 19 Deep Value & Solvency Metrics")
         st.markdown("Statistically driven fundamental breakdown using the TTM (Trailing Twelve Months) or MRQ (Most Recent Quarter) periods.")
         
         metrics_data = [
@@ -239,10 +309,13 @@ if df is not None:
             ("Price to Sales (P/S)", safe_get(info, 'priceToSalesTrailing12Months', format_type='float'), r"\frac{\text{Market Cap}}{\text{Total Revenue}}", "TTM"),
             ("EV to EBITDA", safe_get(info, 'enterpriseToEbitda', format_type='float'), r"\frac{\text{Enterprise Value}}{\text{EBITDA}}", "TTM"),
             ("EV to Revenue", safe_get(info, 'enterpriseToRevenue', format_type='float'), r"\frac{\text{Enterprise Value}}{\text{Revenue}}", "TTM"),
+            ("EV to Free Cash Flow", safe_get(info, 'enterpriseValue') / safe_get(info, 'freeCashflow', default=1) if safe_get(info, 'freeCashflow') not in [None, "N/A"] else "N/A", r"\frac{\text{Enterprise Value}}{\text{Free Cash Flow}}", "TTM"),
             ("Dividend Yield", safe_get(info, 'dividendYield', format_type='pct'), r"\frac{\text{Annual Dividends per Share}}{\text{Price per Share}}", "Forward"),
             ("Payout Ratio", safe_get(info, 'payoutRatio', format_type='pct'), r"\frac{\text{Dividends Paid}}{\text{Net Income}}", "TTM"),
+            ("Free Cash Flow Yield", safe_get(info, 'freeCashflow') / safe_get(info, 'marketCap', default=1) if safe_get(info, 'freeCashflow') not in [None, "N/A"] else "N/A", r"\frac{\text{Free Cash Flow}}{\text{Market Cap}}", "TTM"),
             ("Current Ratio", safe_get(info, 'currentRatio', format_type='float'), r"\frac{\text{Current Assets}}{\text{Current Liabilities}}", "MRQ"),
             ("Quick Ratio", safe_get(info, 'quickRatio', format_type='float'), r"\frac{\text{Current Assets} - \text{Inventory}}{\text{Current Liabilities}}", "MRQ"),
+            ("Cash Ratio", safe_get(info, 'totalCash') / safe_get(info, 'totalDebt', default=1) if safe_get(info, 'totalCash') not in [None, "N/A"] else "N/A", r"\frac{\text{Cash & Equivalents}}{\text{Current Liabilities}}", "MRQ"),
             ("Debt to Equity", safe_get(info, 'debtToEquity', format_type='float'), r"\frac{\text{Total Liabilities}}{\text{Shareholders' Equity}}", "MRQ"),
             ("Return on Equity (ROE)", safe_get(info, 'returnOnEquity', format_type='pct'), r"\frac{\text{Net Income}}{\text{Shareholders' Equity}}", "TTM"),
             ("Return on Assets (ROA)", safe_get(info, 'returnOnAssets', format_type='pct'), r"\frac{\text{Net Income}}{\text{Total Assets}}", "TTM"),
@@ -250,26 +323,33 @@ if df is not None:
             ("Operating Margin", safe_get(info, 'operatingMargins', format_type='pct'), r"\frac{\text{Operating Income}}{\text{Revenue}}", "TTM"),
         ]
 
-        # Display as columns for scannability
-        for i in range(0, len(metrics_data), 2):
+        # Formatting floats for newly calculated metrics
+        formatted_metrics = []
+        for name, val, formula, period in metrics_data:
+            if isinstance(val, (float, np.float64)) and name in ["EV to Free Cash Flow", "Cash Ratio"]:
+                val = f"{val:.2f}"
+            elif isinstance(val, (float, np.float64)) and name in ["Free Cash Flow Yield"]:
+                val = f"{val*100:.2f}%"
+            formatted_metrics.append((name, val, formula, period))
+
+        for i in range(0, len(formatted_metrics), 2):
             col1, col2 = st.columns(2)
             with col1:
-                st.markdown(f"**{metrics_data[i][0]}** | Period: *{metrics_data[i][3]}*")
-                st.latex(metrics_data[i][2])
-                st.markdown(f"> **Value: {metrics_data[i][1]}**")
+                st.markdown(f"**{formatted_metrics[i][0]}** | Period: *{formatted_metrics[i][3]}*")
+                st.latex(formatted_metrics[i][2])
+                st.markdown(f"> **Value: {formatted_metrics[i][1]}**")
                 st.divider()
-            if i + 1 < len(metrics_data):
+            if i + 1 < len(formatted_metrics):
                 with col2:
-                    st.markdown(f"**{metrics_data[i+1][0]}** | Period: *{metrics_data[i+1][3]}*")
-                    st.latex(metrics_data[i+1][2])
-                    st.markdown(f"> **Value: {metrics_data[i+1][1]}**")
+                    st.markdown(f"**{formatted_metrics[i+1][0]}** | Period: *{formatted_metrics[i+1][3]}*")
+                    st.latex(formatted_metrics[i+1][2])
+                    st.markdown(f"> **Value: {formatted_metrics[i+1][1]}**")
                     st.divider()
 
     # ==========================================
     # TAB 3: DUPONT ANALYSIS
     # ==========================================
     with tab3:
-        
         st.subheader("🔍 3-Step DuPont Analysis")
         st.markdown("Breaking down Return on Equity (ROE) to identify the true driver of returns: Profitability, Efficiency, or Leverage.")
         
