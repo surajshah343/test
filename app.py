@@ -134,6 +134,8 @@ lookback = st.sidebar.slider("Lookback Window:", 10, 60, 30)
 epochs = st.sidebar.slider("Training Epochs:", 10, 100, 30)
 n_splits = st.sidebar.slider("TSCV Folds:", 2, 5, 3)
 forecast_horizon = st.sidebar.selectbox("Forecast Horizon:", ["1 Week", "1 Month", "1 Year"])
+st.sidebar.divider()
+fib_window = st.sidebar.slider("Fibonacci Window (Days):", 30, 1000, 252)
 
 df = load_and_process(ticker)
 info, bs, ic = get_fundamentals(ticker)
@@ -150,17 +152,23 @@ if df is not None:
     with tab1:
         st.subheader("Historical Price Action (2015 - Present)")
         
-        max_price = df['High'].max()
-        min_price = df['Low'].min()
+        # Dynamic Fibonacci Retracement Levels using extreme wick ends for trailing window
+        actual_window = min(fib_window, len(df))
+        fib_df = df.tail(actual_window)
+        max_price = fib_df['High'].max()
+        min_price = fib_df['Low'].min()
+        start_date = fib_df['Date'].iloc[0]
+        end_date = fib_df['Date'].iloc[-1]
+        
         diff = max_price - min_price
         fib_levels = {
-            "0.0% (Low)": min_price,
+            "0.0% (Low Wick)": min_price,
             "23.6%": max_price - 0.236 * diff,
             "38.2%": max_price - 0.382 * diff,
             "50.0%": max_price - 0.5 * diff,
             "61.8%": max_price - 0.618 * diff,
             "78.6%": max_price - 0.786 * diff,
-            "100.0% (High)": max_price
+            "100.0% (High Wick)": max_price
         }
 
         fig_hist = go.Figure()
@@ -170,9 +178,19 @@ if df is not None:
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Support_60d'], name="60d Support", line=dict(color="red", dash="dash")))
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Resistance_60d'], name="60d Resistance", line=dict(color="green", dash="dash")))
         
+        # Draw Fibonacci levels strictly over the trailing window
         colors = ["#ff9999", "#ffcc99", "#ffff99", "#ccff99", "#99ff99", "#99ccff", "#cc99ff"]
         for (level_name, price), color in zip(fib_levels.items(), colors):
-            fig_hist.add_hline(y=price, line_dash="dot", line_color=color, annotation_text=level_name, annotation_position="top left")
+            fig_hist.add_trace(go.Scatter(
+                x=[start_date, end_date], 
+                y=[price, price], 
+                mode="lines+text",
+                name=f"Fib {level_name}",
+                line=dict(color=color, dash="dot"),
+                text=[None, f"{level_name}"],
+                textposition="top left",
+                showlegend=False
+            ))
 
         fig_hist.update_layout(template="plotly_dark", height=600, margin=dict(l=0, r=0, t=30, b=0))
         st.plotly_chart(fig_hist, use_container_width=True)
@@ -207,7 +225,7 @@ if df is not None:
                     for epoch in range(epochs):
                         model.train()
                         optimizer.zero_grad()
-                        loss = nn.HuberLoss()(model(X_train), y_train) # Huber loss handles outliers better than MSE
+                        loss = nn.HuberLoss()(model(X_train), y_train) 
                         loss.backward()
                         optimizer.step()
                         scheduler.step(loss)
