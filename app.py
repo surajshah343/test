@@ -28,17 +28,13 @@ class TemporalAttention(nn.Module):
 class HybridQuantModel(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
-        # Spatial Feature Extraction
         self.cnn = nn.Sequential(
             nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1),
             nn.BatchNorm1d(64)
         )
-        # Temporal Processing
         self.lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True, dropout=0.3)
-        # Attention Mechanism
         self.attention = TemporalAttention(128)
-        # Fully Connected Regression Head
         self.fc = nn.Sequential(
             nn.Linear(128, 64),
             nn.GELU(),
@@ -47,16 +43,14 @@ class HybridQuantModel(nn.Module):
         )
 
     def forward(self, x):
-        # CNN expects (batch, channels, length)
         x = x.transpose(1, 2) 
         x = self.cnn(x)
-        # LSTM expects (batch, length, features)
         x = x.transpose(1, 2)
         lstm_out, _ = self.lstm(x)
         context, _ = self.attention(lstm_out)
         return self.fc(context)
 
-# --- 2. DATA PIPELINE & STRICT NO-LEAKAGE HELPERS ---
+# --- 2. DATA PIPELINE & HELPERS ---
 def calculate_rsi(series, window=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
@@ -66,29 +60,22 @@ def calculate_rsi(series, window=14):
 
 @st.cache_data(ttl=3600)
 def load_and_process(symbol):
-    # Requirement: Start data 10 years from 2015
     df = yf.download(symbol, start="2018-01-01", interval="1d", progress=False)
     if df.empty: return None
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df = df.reset_index()
     
-    # Technical Features (Calculated on current day 't')
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol_20'] = df['Log_Ret'].rolling(20).std()
     df['RSI'] = calculate_rsi(df['Close'], 14)
     
-    # Baseline Strategy Features
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
     
-    # Support & Resistance (Strict Leakage Prevention: Shift by 1 so today isn't included)
     df['Support_60d'] = df['Low'].shift(1).rolling(window=60).min()
     df['Resistance_60d'] = df['High'].shift(1).rolling(window=60).max()
     
-    # Target: Next day's return (t+1)
     df['Target'] = df['Log_Ret'].shift(-1)
-    
-    # Drop NaNs created by rolling windows and the final row (which has no t+1 target)
     return df.dropna().reset_index(drop=True)
 
 @st.cache_data(ttl=86400)
@@ -109,7 +96,6 @@ def create_sequences(data, features, target_col, s_x, s_y, window):
     xs, ys = [], []
     for i in range(len(x_sc) - window):
         xs.append(x_sc[i:i+window])
-        # Target aligns exactly with the period *following* the window
         ys.append(y_sc[i+window])
     return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
 
@@ -130,17 +116,30 @@ def safe_get(d, key, default="N/A", format_type="num"):
 # --- 3. UI & DASHBOARD SETUP ---
 st.sidebar.header("🕹️ Quantitative Engine")
 ticker = st.sidebar.text_input("Ticker Symbol:", value="AAPL").upper()
-lookback = st.sidebar.slider("Lookback Window:", 10, 60, 30)
-epochs = st.sidebar.slider("Training Epochs:", 10, 100, 30)
-n_splits = st.sidebar.slider("TSCV Folds:", 2, 5, 3)
-forecast_horizon = st.sidebar.selectbox("Forecast Horizon:", ["1 Week", "1 Month", "1 Year"])
-st.sidebar.divider()
-fib_window = st.sidebar.slider("Fibonacci Window (Days):", 30, 1000, 252)
-
 df = load_and_process(ticker)
 info, bs, ic = get_fundamentals(ticker)
 
 if df is not None:
+    lookback = st.sidebar.slider("Lookback Window:", 10, 60, 30)
+    epochs = st.sidebar.slider("Training Epochs:", 10, 100, 30)
+    n_splits = st.sidebar.slider("TSCV Folds:", 2, 5, 3)
+    forecast_horizon = st.sidebar.selectbox("Forecast Horizon:", ["1 Week", "1 Month", "1 Year"])
+    
+    st.sidebar.divider()
+    st.sidebar.subheader("📐 Chart Tools")
+    fib_mode = st.sidebar.radio("Fibonacci Anchors:", ["Auto (Trailing Window)", "Manual (Custom Swings)"])
+    
+    # Store dynamic dates based on mode
+    if fib_mode == "Auto (Trailing Window)":
+        fib_window = st.sidebar.slider("Fibonacci Window (Days):", 30, 1000, 252)
+    else:
+        min_dt = df['Date'].min().date()
+        max_dt = df['Date'].max().date()
+        
+        st.sidebar.markdown("*(Find the date you want to anchor to on the chart and input it here)*")
+        swing_high_date = st.sidebar.date_input("Swing High Date", value=max_dt, min_value=min_dt, max_value=max_dt)
+        swing_low_date = st.sidebar.date_input("Swing Low Date", value=min_dt, min_value=min_dt, max_value=max_dt)
+
     st.title(f"🚀 AI Quant Dashboard: {ticker}")
     st.markdown(f"**Sector:** {info.get('sector', 'N/A')} | **Industry:** {info.get('industry', 'N/A')} | **Market Cap:** {safe_get(info, 'marketCap', format_type='curr')}")
     
@@ -150,25 +149,37 @@ if df is not None:
     # TAB 1: TECHNICALS & FORECAST
     # ==========================================
     with tab1:
-        st.subheader("Historical Price Action (2015 - Present)")
+        st.subheader("Historical Price Action (Interactive Mode)")
         
-        # Dynamic Fibonacci Retracement Levels using extreme wick ends for trailing window
-        actual_window = min(fib_window, len(df))
-        fib_df = df.tail(actual_window)
-        max_price = fib_df['High'].max()
-        min_price = fib_df['Low'].min()
-        start_date = fib_df['Date'].iloc[0]
-        end_date = fib_df['Date'].iloc[-1]
-        
+        # Calculate Fibonacci Levels based on selected mode
+        if fib_mode == "Auto (Trailing Window)":
+            actual_window = min(fib_window, len(df))
+            fib_df = df.tail(actual_window)
+            max_price = fib_df['High'].max()
+            min_price = fib_df['Low'].min()
+            start_date = fib_df['Date'].iloc[0]
+            end_date = fib_df['Date'].iloc[-1]
+        else:
+            # Match user-selected dates to closest DataFrame indices to find the exact wicks
+            high_idx = (df['Date'].dt.date - swing_high_date).abs().argsort()[0]
+            low_idx = (df['Date'].dt.date - swing_low_date).abs().argsort()[0]
+            
+            max_price = df.iloc[high_idx]['High']
+            min_price = df.iloc[low_idx]['Low']
+            
+            # Start drawing from the earlier date to the present
+            start_date = min(df.iloc[high_idx]['Date'], df.iloc[low_idx]['Date'])
+            end_date = df['Date'].iloc[-1]
+
         diff = max_price - min_price
         fib_levels = {
-            "0.0% (Low Wick)": min_price,
+            "0.0%": min_price,
             "23.6%": max_price - 0.236 * diff,
             "38.2%": max_price - 0.382 * diff,
             "50.0%": max_price - 0.5 * diff,
             "61.8%": max_price - 0.618 * diff,
             "78.6%": max_price - 0.786 * diff,
-            "100.0% (High Wick)": max_price
+            "100.0%": max_price
         }
 
         fig_hist = go.Figure()
@@ -178,7 +189,7 @@ if df is not None:
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Support_60d'], name="60d Support", line=dict(color="red", dash="dash")))
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Resistance_60d'], name="60d Resistance", line=dict(color="green", dash="dash")))
         
-        # Draw Fibonacci levels strictly over the trailing window
+        # Draw Fibonacci levels
         colors = ["#ff9999", "#ffcc99", "#ffff99", "#ccff99", "#99ff99", "#99ccff", "#cc99ff"]
         for (level_name, price), color in zip(fib_levels.items(), colors):
             fig_hist.add_trace(go.Scatter(
@@ -192,8 +203,23 @@ if df is not None:
                 showlegend=False
             ))
 
-        fig_hist.update_layout(template="plotly_dark", height=600, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig_hist, use_container_width=True)
+        fig_hist.update_layout(
+            template="plotly_dark", 
+            height=600, 
+            margin=dict(l=0, r=0, t=30, b=0),
+            dragmode='pan' # Default to panning so drawing isn't accidental
+        )
+        
+        # Enable Plotly Drawing Tools in the Streamlit Config
+        st.plotly_chart(
+            fig_hist, 
+            use_container_width=True, 
+            config={
+                'modeBarButtonsToAdd': ['drawline', 'drawopenpath', 'eraseshape'],
+                'scrollZoom': True
+            }
+        )
+        st.info("💡 **Tip:** Use the toolbar in the top right of the chart to manually draw lines (`drawline`), annotate, or erase custom markings (`eraseshape`).")
 
         if st.button("🔄 Run AI Model Pipeline & Generate Forecast"):
             features = ['Log_Ret', 'Vol_20', 'RSI']
@@ -211,7 +237,6 @@ if df is not None:
                     if i == n_splits - 1:
                         last_train_df, last_test_df = train_df, test_df
 
-                    # Fit scalers ONLY on training data to prevent look-ahead bias
                     sc_x = RobustScaler().fit(train_df[features])
                     sc_y = RobustScaler().fit(train_df[['Target']])
                     
@@ -236,10 +261,8 @@ if df is not None:
                         y_pred_ai = sc_y.inverse_transform(y_pred_scaled).flatten()
                         y_actual = sc_y.inverse_transform(y_test.numpy()).flatten()
                         
-                        # Align MA signals with the test window prediction targets
                         ma_signals = np.where(test_df['SMA_20'].iloc[lookback:-1].values > test_df['SMA_50'].iloc[lookback:-1].values, 1, 0)
                         
-                        # Adjust lengths safely in case of rounding disparities
                         min_len = min(len(y_actual), len(ma_signals))
                         y_actual, y_pred_ai, ma_signals = y_actual[:min_len], y_pred_ai[:min_len], ma_signals[:min_len]
 
@@ -276,7 +299,6 @@ if df is not None:
                 forecast_dates = [df['Date'].iloc[-1]]
                 
                 h_days = {'1 Week': 5, '1 Month': 21, '1 Year': 252}[forecast_horizon]
-                
                 recent_prices = list(df['Close'].tail(max(20, lookback)).values)
                 recent_rets = list(df['Log_Ret'].tail(max(20, lookback)).values)
                 
@@ -285,7 +307,6 @@ if df is not None:
                     with torch.no_grad():
                         p_ret = sc_y_f.inverse_transform([[prod_model(win_t).item()]])[0][0]
                     
-                    # Autoregressive dampening to prevent compounding error blowouts over long horizons
                     if forecast_horizon == '1 Year':
                         p_ret = p_ret * 0.95
                     
@@ -321,7 +342,6 @@ if df is not None:
             # --- FORECAST ACCURACY ---
             st.subheader("🎯 Out-of-Sample Accuracy: Advanced DL vs Moving Average Baseline")
             
-            # Classification arrays for directional tracking
             y_act_dir = (np.array(y_actual_all) > 0).astype(int)
             y_pred_ai_dir = (np.array(y_pred_ai_all) > 0).astype(int)
             y_pred_ma_dir = np.array(y_pred_ma_all)
@@ -370,7 +390,6 @@ if df is not None:
     # ==========================================
     with tab2:
         st.subheader("💎 20 Deep Value & Solvency Metrics")
-        st.markdown("Statistically driven fundamental breakdown using the TTM or MRQ periods.")
         
         eps_val = info.get('trailingEps')
         bvps_val = info.get('bookValue')
@@ -430,7 +449,6 @@ if df is not None:
     # ==========================================
     with tab3:
         st.subheader("🔍 3-Step DuPont Analysis")
-        st.markdown("Breaking down Return on Equity (ROE) to identify the true driver of returns.")
         
         st.latex(r"ROE = \left( \frac{\text{Net Income}}{\text{Sales}} \right) \times \left( \frac{\text{Sales}}{\text{Total Assets}} \right) \times \left( \frac{\text{Total Assets}}{\text{Total Equity}} \right)")
         st.latex(r"ROE = \text{Net Profit Margin} \times \text{Asset Turnover} \times \text{Equity Multiplier}")
@@ -453,7 +471,6 @@ if df is not None:
                 col3.metric("Equity Multiplier (Leverage)", f"{em:.2f}x")
                 col4.metric("Calculated ROE", f"{calculated_roe*100:.2f}%", delta="DuPont Result")
                 
-                st.info("💡 **Interpretation:** High ROE driven by Net Profit Margin is highly desirable (pricing power). If driven mostly by the Equity Multiplier, the company relies heavily on debt.")
             else:
                 st.warning("Insufficient balance sheet or income statement data available.")
         except Exception as e:
