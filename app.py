@@ -5,11 +5,15 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, f1_score, precision_score
+from sklearn.metrics import mean_squared_error, f1_score
 from plotly import graph_objs as go
 import plotly.express as px
+
+# Setup hardware acceleration
+device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 st.set_page_config(page_title="Pro Quant Dashboard", layout="wide")
 
@@ -17,7 +21,11 @@ st.set_page_config(page_title="Pro Quant Dashboard", layout="wide")
 class TemporalAttention(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        self.attention = nn.Linear(hidden_dim, 1)
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
 
     def forward(self, lstm_out):
         # lstm_out shape: (batch_size, seq_length, hidden_size)
@@ -28,13 +36,17 @@ class TemporalAttention(nn.Module):
 class HybridQuantModel(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
+        # Spatial Feature Extraction
         self.cnn = nn.Sequential(
             nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1),
             nn.BatchNorm1d(64)
         )
+        # Temporal Processing
         self.lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True, dropout=0.3)
+        # Attention Mechanism
         self.attention = TemporalAttention(128)
+        # Fully Connected Regression Head
         self.fc = nn.Sequential(
             nn.Linear(128, 64),
             nn.GELU(),
@@ -43,14 +55,16 @@ class HybridQuantModel(nn.Module):
         )
 
     def forward(self, x):
+        # CNN expects (batch, channels, length)
         x = x.transpose(1, 2) 
         x = self.cnn(x)
+        # LSTM expects (batch, length, features)
         x = x.transpose(1, 2)
         lstm_out, _ = self.lstm(x)
         context, _ = self.attention(lstm_out)
         return self.fc(context)
 
-# --- 2. DATA PIPELINE & HELPERS ---
+# --- 2. DATA PIPELINE & STRICT NO-LEAKAGE HELPERS ---
 def calculate_rsi(series, window=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
@@ -60,22 +74,24 @@ def calculate_rsi(series, window=14):
 
 @st.cache_data(ttl=3600)
 def load_and_process(symbol):
-    df = yf.download(symbol, start="2018-01-01", interval="1d", progress=False)
+    df = yf.download(symbol, start="2015-01-01", interval="1d", progress=False)
     if df.empty: return None
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df = df.reset_index()
     
+    # Technical Features (Calculated on current day 't')
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['Vol_20'] = df['Log_Ret'].rolling(20).std()
     df['RSI'] = calculate_rsi(df['Close'], 14)
     
+    # Baseline Strategy Features
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
     
+    # Support & Resistance (Strict Leakage Prevention: Shift by 1)
     df['Support_60d'] = df['Low'].shift(1).rolling(window=60).min()
     df['Resistance_60d'] = df['High'].shift(1).rolling(window=60).max()
     
-    df['Target'] = df['Log_Ret'].shift(-1)
     return df.dropna().reset_index(drop=True)
 
 @st.cache_data(ttl=86400)
@@ -85,7 +101,7 @@ def get_fundamentals(symbol):
     try:
         bs = tkr.balance_sheet
         ic = tkr.income_stmt
-    except:
+    except Exception:
         bs = pd.DataFrame()
         ic = pd.DataFrame()
     return info, bs, ic
@@ -96,13 +112,15 @@ def create_sequences(data, features, target_col, s_x, s_y, window):
     xs, ys = [], []
     for i in range(len(x_sc) - window):
         xs.append(x_sc[i:i+window])
+        # Target natively aligns with the period *following* the window
         ys.append(y_sc[i+window])
     return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
 
 def calculate_max_drawdown(returns):
+    if not returns: return 0.0
     cumulative = np.exp(np.cumsum(returns))
     running_max = np.maximum.accumulate(cumulative)
-    drawdowns = (cumulative - running_max) / running_max
+    drawdowns = (cumulative - running_max) / (running_max + 1e-9)
     return np.min(drawdowns) * 100
 
 def safe_get(d, key, default="N/A", format_type="num"):
@@ -113,73 +131,57 @@ def safe_get(d, key, default="N/A", format_type="num"):
     if format_type == "float": return f"{val:.2f}"
     return val
 
+def get_financial_metric(df, keys):
+    if df.empty: return None
+    for k in keys:
+        if k in df.index:
+            val = df.loc[k].iloc[0]
+            if pd.notna(val): return val
+    return None
+
 # --- 3. UI & DASHBOARD SETUP ---
 st.sidebar.header("🕹️ Quantitative Engine")
 ticker = st.sidebar.text_input("Ticker Symbol:", value="AAPL").upper()
+lookback = st.sidebar.slider("Lookback Window:", 10, 60, 30)
+epochs = st.sidebar.slider("Training Epochs:", 10, 100, 30)
+batch_size = st.sidebar.selectbox("Batch Size:", [32, 64, 128], index=1)
+n_splits = st.sidebar.slider("TSCV Folds:", 2, 5, 3)
+forecast_horizon = st.sidebar.selectbox("Forecast Horizon:", ["1 Week", "1 Month", "1 Year"])
+st.sidebar.divider()
+fib_window = st.sidebar.slider("Fibonacci Window (Days):", 30, 1000, 252)
+
 df = load_and_process(ticker)
 info, bs, ic = get_fundamentals(ticker)
 
 if df is not None:
-    lookback = st.sidebar.slider("Lookback Window:", 10, 60, 30)
-    epochs = st.sidebar.slider("Training Epochs:", 10, 100, 30)
-    n_splits = st.sidebar.slider("TSCV Folds:", 2, 5, 3)
-    forecast_horizon = st.sidebar.selectbox("Forecast Horizon:", ["1 Week", "1 Month", "1 Year"])
-    
-    st.sidebar.divider()
-    st.sidebar.subheader("📐 Chart Tools")
-    fib_mode = st.sidebar.radio("Fibonacci Anchors:", ["Auto (Trailing Window)", "Manual (Custom Swings)"])
-    
-    # Store dynamic dates based on mode
-    if fib_mode == "Auto (Trailing Window)":
-        fib_window = st.sidebar.slider("Fibonacci Window (Days):", 30, 1000, 252)
-    else:
-        min_dt = df['Date'].min().date()
-        max_dt = df['Date'].max().date()
-        
-        st.sidebar.markdown("*(Find the date you want to anchor to on the chart and input it here)*")
-        swing_high_date = st.sidebar.date_input("Swing High Date", value=max_dt, min_value=min_dt, max_value=max_dt)
-        swing_low_date = st.sidebar.date_input("Swing Low Date", value=min_dt, min_value=min_dt, max_value=max_dt)
-
     st.title(f"🚀 AI Quant Dashboard: {ticker}")
     st.markdown(f"**Sector:** {info.get('sector', 'N/A')} | **Industry:** {info.get('industry', 'N/A')} | **Market Cap:** {safe_get(info, 'marketCap', format_type='curr')}")
+    st.markdown(f"*Compute Device: {device.type.upper()}*")
     
-    tab1, tab2, tab3 = st.tabs(["📈 Technicals, AI vs Baseline & Forecast", "💎 Deep Value Metrics", "🔍 DuPont Analysis"])
+    tab1, tab2, tab3 = st.tabs(["📈 Technicals & Forecast", "💎 Deep Value", "🔍 DuPont Analysis"])
 
     # ==========================================
     # TAB 1: TECHNICALS & FORECAST
     # ==========================================
     with tab1:
-        st.subheader("Historical Price Action (Interactive Mode)")
+        st.subheader("Historical Price Action")
         
-        # Calculate Fibonacci Levels based on selected mode
-        if fib_mode == "Auto (Trailing Window)":
-            actual_window = min(fib_window, len(df))
-            fib_df = df.tail(actual_window)
-            max_price = fib_df['High'].max()
-            min_price = fib_df['Low'].min()
-            start_date = fib_df['Date'].iloc[0]
-            end_date = fib_df['Date'].iloc[-1]
-        else:
-            # Match user-selected dates to closest DataFrame indices to find the exact wicks
-            high_idx = (df['Date'].dt.date - swing_high_date).abs().argsort()[0]
-            low_idx = (df['Date'].dt.date - swing_low_date).abs().argsort()[0]
-            
-            max_price = df.iloc[high_idx]['High']
-            min_price = df.iloc[low_idx]['Low']
-            
-            # Start drawing from the earlier date to the present
-            start_date = min(df.iloc[high_idx]['Date'], df.iloc[low_idx]['Date'])
-            end_date = df['Date'].iloc[-1]
-
+        actual_window = min(fib_window, len(df))
+        fib_df = df.tail(actual_window)
+        max_price = fib_df['High'].max()
+        min_price = fib_df['Low'].min()
+        start_date = fib_df['Date'].iloc[0]
+        end_date = fib_df['Date'].iloc[-1]
+        
         diff = max_price - min_price
         fib_levels = {
-            "0.0%": min_price,
+            "0.0% (Low Wick)": min_price,
             "23.6%": max_price - 0.236 * diff,
             "38.2%": max_price - 0.382 * diff,
             "50.0%": max_price - 0.5 * diff,
             "61.8%": max_price - 0.618 * diff,
             "78.6%": max_price - 0.786 * diff,
-            "100.0%": max_price
+            "100.0% (High Wick)": max_price
         }
 
         fig_hist = go.Figure()
@@ -189,7 +191,6 @@ if df is not None:
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Support_60d'], name="60d Support", line=dict(color="red", dash="dash")))
         fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Resistance_60d'], name="60d Resistance", line=dict(color="green", dash="dash")))
         
-        # Draw Fibonacci levels
         colors = ["#ff9999", "#ffcc99", "#ffff99", "#ccff99", "#99ff99", "#99ccff", "#cc99ff"]
         for (level_name, price), color in zip(fib_levels.items(), colors):
             fig_hist.add_trace(go.Scatter(
@@ -203,66 +204,58 @@ if df is not None:
                 showlegend=False
             ))
 
-        fig_hist.update_layout(
-            template="plotly_dark", 
-            height=600, 
-            margin=dict(l=0, r=0, t=30, b=0),
-            dragmode='pan' # Default to panning so drawing isn't accidental
-        )
-        
-        # Enable Plotly Drawing Tools in the Streamlit Config
-        st.plotly_chart(
-            fig_hist, 
-            use_container_width=True, 
-            config={
-                'modeBarButtonsToAdd': ['drawline', 'drawopenpath', 'eraseshape'],
-                'scrollZoom': True
-            }
-        )
-        st.info("💡 **Tip:** Use the toolbar in the top right of the chart to manually draw lines (`drawline`), annotate, or erase custom markings (`eraseshape`).")
+        fig_hist.update_layout(template="plotly_dark", height=600, margin=dict(l=0, r=0, t=30, b=0))
+        st.plotly_chart(fig_hist, use_container_width=True)
 
         if st.button("🔄 Run AI Model Pipeline & Generate Forecast"):
             features = ['Log_Ret', 'Vol_20', 'RSI']
+            target_col = 'Log_Ret'
             tscv = TimeSeriesSplit(n_splits=n_splits)
             
             y_actual_all, y_pred_ai_all, y_pred_ma_all = [], [], []
             strat_rets_ai_all, strat_rets_ma_all = [], []
-            
             last_train_df, last_test_df = None, None
 
             with st.status("Training CNN-LSTM Attention Model (Strict No-Leakage Policy)...", expanded=True) as status:
                 for i, (train_idx, test_idx) in enumerate(tscv.split(df)):
                     train_df, test_df = df.iloc[train_idx], df.iloc[test_idx]
-                    
-                    if i == n_splits - 1:
-                        last_train_df, last_test_df = train_df, test_df
+                    if i == n_splits - 1: last_train_df, last_test_df = train_df, test_df
 
                     sc_x = RobustScaler().fit(train_df[features])
-                    sc_y = RobustScaler().fit(train_df[['Target']])
+                    sc_y = RobustScaler().fit(train_df[[target_col]])
                     
-                    X_train, y_train = create_sequences(train_df, features, 'Target', sc_x, sc_y, lookback)
-                    X_test, y_test = create_sequences(test_df, features, 'Target', sc_x, sc_y, lookback)
+                    X_train, y_train = create_sequences(train_df, features, target_col, sc_x, sc_y, lookback)
+                    X_test, y_test = create_sequences(test_df, features, target_col, sc_x, sc_y, lookback)
                     
-                    model = HybridQuantModel(len(features))
+                    train_dataset = TensorDataset(X_train, y_train)
+                    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+                    
+                    model = HybridQuantModel(len(features)).to(device)
                     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
                     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
+                    criterion = nn.HuberLoss()
                     
                     for epoch in range(epochs):
                         model.train()
-                        optimizer.zero_grad()
-                        loss = nn.HuberLoss()(model(X_train), y_train) 
-                        loss.backward()
-                        optimizer.step()
-                        scheduler.step(loss)
+                        epoch_loss = 0
+                        for batch_x, batch_y in train_loader:
+                            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                            optimizer.zero_grad()
+                            loss = criterion(model(batch_x), batch_y) 
+                            loss.backward()
+                            optimizer.step()
+                            epoch_loss += loss.item()
+                        scheduler.step(epoch_loss)
                     
                     model.eval()
                     with torch.no_grad():
-                        y_pred_scaled = model(X_test).numpy()
+                        X_test_dev = X_test.to(device)
+                        y_pred_scaled = model(X_test_dev).cpu().numpy()
                         y_pred_ai = sc_y.inverse_transform(y_pred_scaled).flatten()
                         y_actual = sc_y.inverse_transform(y_test.numpy()).flatten()
                         
-                        ma_signals = np.where(test_df['SMA_20'].iloc[lookback:-1].values > test_df['SMA_50'].iloc[lookback:-1].values, 1, 0)
-                        
+                        # Align MA signals
+                        ma_signals = np.where(test_df['SMA_20'].iloc[lookback:].values > test_df['SMA_50'].iloc[lookback:].values, 1, -1)
                         min_len = min(len(y_actual), len(ma_signals))
                         y_actual, y_pred_ai, ma_signals = y_actual[:min_len], y_pred_ai[:min_len], ma_signals[:min_len]
 
@@ -271,7 +264,7 @@ if df is not None:
                         y_pred_ma_all.extend(ma_signals)
                         
                         ai_rets = np.where(y_pred_ai > 0, 1, -1) * y_actual
-                        ma_rets = np.where(ma_signals > 0, 1, -1) * y_actual
+                        ma_rets = ma_signals * y_actual
                         
                         strat_rets_ai_all.extend(ai_rets)
                         strat_rets_ma_all.extend(ma_rets)
@@ -281,51 +274,60 @@ if df is not None:
                 
                 # --- PRODUCTION MODEL & FORECAST ---
                 st.write("🌐 Training Final Production Model on Full Dataset...")
-                prod_model = HybridQuantModel(len(features))
+                prod_model = HybridQuantModel(len(features)).to(device)
                 opt_f = torch.optim.AdamW(prod_model.parameters(), lr=0.001)
+                
                 sc_x_f = RobustScaler().fit(df[features])
-                sc_y_f = RobustScaler().fit(df[['Target']])
-                X_f, y_f = create_sequences(df, features, 'Target', sc_x_f, sc_y_f, lookback)
+                sc_y_f = RobustScaler().fit(df[[target_col]])
+                X_f, y_f = create_sequences(df, features, target_col, sc_x_f, sc_y_f, lookback)
+                
+                prod_dataset = TensorDataset(X_f, y_f)
+                prod_loader = DataLoader(prod_dataset, batch_size=batch_size, shuffle=True)
                 
                 for _ in range(epochs):
                     prod_model.train()
-                    opt_f.zero_grad()
-                    nn.HuberLoss()(prod_model(X_f), y_f).backward()
-                    opt_f.step()
+                    for batch_x, batch_y in prod_loader:
+                        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                        opt_f.zero_grad()
+                        nn.HuberLoss()(prod_model(batch_x), batch_y).backward()
+                        opt_f.step()
 
                 prod_model.eval()
-                current_win = df[features].tail(lookback).values
+                current_win_unscaled = df[features].tail(lookback).values
                 forecast_prices = [df['Close'].iloc[-1]]
                 forecast_dates = [df['Date'].iloc[-1]]
-                
                 h_days = {'1 Week': 5, '1 Month': 21, '1 Year': 252}[forecast_horizon]
+                
                 recent_prices = list(df['Close'].tail(max(20, lookback)).values)
                 recent_rets = list(df['Log_Ret'].tail(max(20, lookback)).values)
                 
                 for _ in range(h_days):
-                    win_t = torch.FloatTensor(sc_x_f.transform(current_win)).unsqueeze(0)
+                    # Scale current window for inference
+                    win_scaled = sc_x_f.transform(current_win_unscaled)
+                    win_t = torch.FloatTensor(win_scaled).unsqueeze(0).to(device)
+                    
                     with torch.no_grad():
-                        p_ret = sc_y_f.inverse_transform([[prod_model(win_t).item()]])[0][0]
+                        pred_scaled = prod_model(win_t).cpu().item()
+                        p_ret = sc_y_f.inverse_transform([[pred_scaled]])[0][0]
                     
                     if forecast_horizon == '1 Year':
-                        p_ret = p_ret * 0.95
+                        p_ret = p_ret * 0.95 # Autoregressive dampening
                     
                     next_price = forecast_prices[-1] * np.exp(p_ret)
                     forecast_prices.append(next_price)
-                    
                     recent_prices.append(next_price)
                     recent_rets.append(p_ret)
                     
                     next_date = forecast_dates[-1] + timedelta(days=1)
-                    while next_date.weekday() >= 5:
-                        next_date += timedelta(days=1)
+                    while next_date.weekday() >= 5: next_date += timedelta(days=1)
                     forecast_dates.append(next_date)
                     
                     new_vol = np.std(recent_rets[-20:])
                     new_rsi = calculate_rsi(pd.Series(recent_prices[-15:]), 14).iloc[-1]
                     
                     new_row = np.array([p_ret, new_vol, new_rsi])
-                    current_win = np.append(current_win[1:], [new_row], axis=0)
+                    # Shift unscaled window
+                    current_win_unscaled = np.append(current_win_unscaled[1:], [new_row], axis=0)
 
                 status.update(label="Validation & Forecasting Complete!", state="complete")
 
@@ -335,23 +337,19 @@ if df is not None:
             fig_f.add_trace(go.Scatter(x=last_train_df['Date'], y=last_train_df['Close'], name="Train Data", line=dict(color="#1f77b4")))
             fig_f.add_trace(go.Scatter(x=last_test_df['Date'], y=last_test_df['Close'], name="Test Data (OOS)", line=dict(color="#ff7f0e")))
             fig_f.add_trace(go.Scatter(x=forecast_dates, y=forecast_prices, name="LSTM Forecast", line=dict(color="#2ca02c", width=3, dash="dash")))
-            
             fig_f.update_layout(template="plotly_dark", height=500, margin=dict(l=0, r=0, t=30, b=0))
             st.plotly_chart(fig_f, use_container_width=True)
 
             # --- FORECAST ACCURACY ---
             st.subheader("🎯 Out-of-Sample Accuracy: Advanced DL vs Moving Average Baseline")
-            
             y_act_dir = (np.array(y_actual_all) > 0).astype(int)
             y_pred_ai_dir = (np.array(y_pred_ai_all) > 0).astype(int)
-            y_pred_ma_dir = np.array(y_pred_ma_all)
+            y_pred_ma_dir = (np.array(y_pred_ma_all) > 0).astype(int)
 
             f1_ai = f1_score(y_act_dir, y_pred_ai_dir)
             f1_ma = f1_score(y_act_dir, y_pred_ma_dir)
-            
             cum_ret_ai = np.sum(strat_rets_ai_all) * 100
             cum_ret_ma = np.sum(strat_rets_ma_all) * 100
-            
             dd_ai = calculate_max_drawdown(strat_rets_ai_all)
             dd_ma = calculate_max_drawdown(strat_rets_ma_all)
 
@@ -374,11 +372,12 @@ if df is not None:
             st.subheader("🧠 Permutation Feature Importance (Spatial)")
             importances = []
             with torch.no_grad():
-                baseline_loss = nn.HuberLoss()(model(X_test), y_test).item()
+                X_test_dev = X_test.to(device)
+                baseline_loss = nn.HuberLoss()(model(X_test_dev), y_test.to(device)).item()
                 for f_idx in range(len(features)):
-                    X_temp = X_test.clone()
+                    X_temp = X_test_dev.clone()
                     X_temp[:, :, f_idx] = X_temp[torch.randperm(X_temp.size(0)), :, f_idx]
-                    shuffled_loss = nn.HuberLoss()(model(X_temp), y_test).item()
+                    shuffled_loss = nn.HuberLoss()(model(X_temp), y_test.to(device)).item()
                     importances.append(max(0, shuffled_loss - baseline_loss))
             
             imp_df = pd.DataFrame({'Feature': features, 'Impact': importances}).sort_values(by='Impact', ascending=True)
@@ -390,7 +389,6 @@ if df is not None:
     # ==========================================
     with tab2:
         st.subheader("💎 20 Deep Value & Solvency Metrics")
-        
         eps_val = info.get('trailingEps')
         bvps_val = info.get('bookValue')
         if eps_val and bvps_val and eps_val > 0 and bvps_val > 0:
@@ -408,13 +406,10 @@ if df is not None:
             ("Price to Sales (P/S)", safe_get(info, 'priceToSalesTrailing12Months', format_type='float'), r"\frac{\text{Market Cap}}{\text{Total Revenue}}", "TTM"),
             ("EV to EBITDA", safe_get(info, 'enterpriseToEbitda', format_type='float'), r"\frac{\text{Enterprise Value}}{\text{EBITDA}}", "TTM"),
             ("EV to Revenue", safe_get(info, 'enterpriseToRevenue', format_type='float'), r"\frac{\text{Enterprise Value}}{\text{Revenue}}", "TTM"),
-            ("EV to Free Cash Flow", safe_get(info, 'enterpriseValue') / safe_get(info, 'freeCashflow', default=1) if safe_get(info, 'freeCashflow') not in [None, "N/A"] else "N/A", r"\frac{\text{Enterprise Value}}{\text{Free Cash Flow}}", "TTM"),
             ("Dividend Yield", safe_get(info, 'dividendYield', format_type='pct'), r"\frac{\text{Annual Dividends per Share}}{\text{Price per Share}}", "Forward"),
             ("Payout Ratio", safe_get(info, 'payoutRatio', format_type='pct'), r"\frac{\text{Dividends Paid}}{\text{Net Income}}", "TTM"),
-            ("Free Cash Flow Yield", safe_get(info, 'freeCashflow') / safe_get(info, 'marketCap', default=1) if safe_get(info, 'freeCashflow') not in [None, "N/A"] else "N/A", r"\frac{\text{Free Cash Flow}}{\text{Market Cap}}", "TTM"),
             ("Current Ratio", safe_get(info, 'currentRatio', format_type='float'), r"\frac{\text{Current Assets}}{\text{Current Liabilities}}", "MRQ"),
             ("Quick Ratio", safe_get(info, 'quickRatio', format_type='float'), r"\frac{\text{Current Assets} - \text{Inventory}}{\text{Current Liabilities}}", "MRQ"),
-            ("Cash Ratio", safe_get(info, 'totalCash') / safe_get(info, 'totalDebt', default=1) if safe_get(info, 'totalCash') not in [None, "N/A"] else "N/A", r"\frac{\text{Cash \& Equivalents}}{\text{Current Liabilities}}", "MRQ"),
             ("Debt to Equity", safe_get(info, 'debtToEquity', format_type='float'), r"\frac{\text{Total Liabilities}}{\text{Shareholders' Equity}}", "MRQ"),
             ("Return on Equity (ROE)", safe_get(info, 'returnOnEquity', format_type='pct'), r"\frac{\text{Net Income}}{\text{Shareholders' Equity}}", "TTM"),
             ("Return on Assets (ROA)", safe_get(info, 'returnOnAssets', format_type='pct'), r"\frac{\text{Net Income}}{\text{Total Assets}}", "TTM"),
@@ -424,10 +419,6 @@ if df is not None:
 
         formatted_metrics = []
         for name, val, formula, period in metrics_data:
-            if isinstance(val, (float, np.float64)) and name in ["EV to Free Cash Flow", "Cash Ratio"]:
-                val = f"{val:.2f}"
-            elif isinstance(val, (float, np.float64)) and name in ["Free Cash Flow Yield"]:
-                val = f"{val*100:.2f}%"
             formatted_metrics.append((name, val, formula, period))
 
         for i in range(0, len(formatted_metrics), 2):
@@ -448,16 +439,20 @@ if df is not None:
     # TAB 3: DUPONT ANALYSIS
     # ==========================================
     with tab3:
-        st.subheader("🔍 3-Step DuPont Analysis")
         
+        st.subheader("🔍 3-Step DuPont Analysis")
         st.latex(r"ROE = \left( \frac{\text{Net Income}}{\text{Sales}} \right) \times \left( \frac{\text{Sales}}{\text{Total Assets}} \right) \times \left( \frac{\text{Total Assets}}{\text{Total Equity}} \right)")
-        st.latex(r"ROE = \text{Net Profit Margin} \times \text{Asset Turnover} \times \text{Equity Multiplier}")
         
         try:
-            net_income = ic.loc['Net Income'].iloc[0] if 'Net Income' in ic.index else None
-            revenue = ic.loc['Total Revenue'].iloc[0] if 'Total Revenue' in ic.index else None
-            total_assets = bs.loc['Total Assets'].iloc[0] if 'Total Assets' in bs.index else None
-            total_equity = bs.loc['Stockholders Equity'].iloc[0] if 'Stockholders Equity' in bs.index else None
+            net_income_keys = ['Net Income', 'Net Income Common Stockholders']
+            revenue_keys = ['Total Revenue', 'Operating Revenue']
+            assets_keys = ['Total Assets']
+            equity_keys = ['Stockholders Equity', 'Total Stockholder Equity', 'Common Stock Equity']
+            
+            net_income = get_financial_metric(ic, net_income_keys)
+            revenue = get_financial_metric(ic, revenue_keys)
+            total_assets = get_financial_metric(bs, assets_keys)
+            total_equity = get_financial_metric(bs, equity_keys)
             
             if all([net_income, revenue, total_assets, total_equity]):
                 npm = net_income / revenue
@@ -471,9 +466,10 @@ if df is not None:
                 col3.metric("Equity Multiplier (Leverage)", f"{em:.2f}x")
                 col4.metric("Calculated ROE", f"{calculated_roe*100:.2f}%", delta="DuPont Result")
                 
+                st.info("💡 **Interpretation:** High ROE driven by Net Profit Margin is highly desirable (pricing power). If driven mostly by the Equity Multiplier, the company relies heavily on debt.")
             else:
-                st.warning("Insufficient balance sheet or income statement data available.")
-        except Exception as e:
+                st.warning("Insufficient balance sheet or income statement data available for this ticker.")
+        except Exception:
             st.error("Error calculating manual DuPont breakdown.")
 else:
     st.error("Ticker not found. Please check the symbol.")
