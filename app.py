@@ -93,6 +93,32 @@ def load_and_process(symbol):
     df['MACD'] = df['EMA_12'] - df['EMA_26']
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+
+    # --- NEW PROFESSIONAL INDICATORS ---
+    # 1. Volume Weighted Moving Average (VWMA - 20 Day)
+    df['VWMA_20'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
+
+    # 2. On-Balance Volume (OBV)
+    df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    df['OBV_EMA'] = df['OBV'].ewm(span=20, adjust=False).mean() # Signal line for OBV
+
+    # 3. Average True Range (ATR - 14 Day)
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = true_range.rolling(14).mean()
+
+    # 4. Negative Volume Index (NVI) - Smart Money Proxy
+    nvi = [1000]
+    for i in range(1, len(df)):
+        if df['Volume'].iloc[i] < df['Volume'].iloc[i-1]:
+            ret = (df['Close'].iloc[i] - df['Close'].iloc[i-1]) / df['Close'].iloc[i-1]
+            nvi.append(nvi[-1] + (ret * nvi[-1]))
+        else:
+            nvi.append(nvi[-1])
+    df['NVI'] = nvi
+    df['NVI_Signal'] = df['NVI'].ewm(span=255, adjust=False).mean() # Standard institutional 1-yr baseline
     
     return df.dropna().reset_index(drop=True)
 
@@ -191,7 +217,23 @@ if df is not None:
     # TAB 1: TECHNICALS & FORECAST
     # ==========================================
     with tab1:
-        st.subheader("Synchronized Technical Analysis")
+        st.subheader("Synchronized Institutional Technical Analysis")
+        
+        with st.expander("📖 How to Read These Professional Indicators", expanded=False):
+            st.markdown("""
+            **1. Volume Weighted Moving Average (VWMA):** Unlike a standard SMA, VWMA gives more weight to high-volume days. *Rule of thumb:* If the price is above the VWMA, institutional momentum is likely bullish. If VWMA crosses above the SMA, volume is supporting the uptrend.
+            
+            **2. Bollinger Bands & RSI:** Used for mean reversion. Price hitting the upper band while RSI > 70 indicates an overextended asset. Price hitting the lower band while RSI < 30 indicates a potential oversold bounce.
+            
+            **3. MACD (Moving Average Convergence Divergence):** A trend-following momentum indicator. *Rule of thumb:* A buy signal occurs when the MACD line crosses above the signal line. The histogram shows the distance between the two (green means momentum is accelerating upward).
+            
+            **4. On-Balance Volume (OBV):** A cumulative indicator measuring buying/selling pressure. *Rule of thumb:* If the price is making higher highs but OBV is making lower highs, a bearish divergence is forming (institutions are offloading).
+            
+            **5. Negative Volume Index (NVI) - *The "Smart Money" Proxy*:** This indicator only updates on days when volume *decreases* from the previous day. The logic is that retail trades aggressively on high volume (news days), while "Smart Money" (institutions) quietly accumulates on low-volume days. *Rule of thumb:* When NVI crosses above its 255-day Signal line, the Smart Money is bullish. 
+            
+            **6. Average True Range (ATR):** Measures market volatility. *Rule of thumb:* Institutional traders use this to set stop-losses. A wider ATR means the asset is experiencing wilder swings and position sizing should be reduced.
+            """)
+
         actual_window = min(fib_window, len(df))
         fib_df = df.tail(actual_window)
         max_price = fib_df['High'].max()
@@ -209,19 +251,26 @@ if df is not None:
 
         # --- COMBINED SUBPLOTS WITH SHARED X-AXIS ---
         fig = make_subplots(
-            rows=4, cols=1, 
+            rows=6, cols=1, 
             shared_xaxes=True, 
             vertical_spacing=0.03,
-            row_heights=[0.4, 0.2, 0.2, 0.2],
-            subplot_titles=("Historical Price & Fibonacci", "Bollinger Bands", "RSI", "MACD")
+            row_heights=[0.35, 0.13, 0.13, 0.13, 0.13, 0.13],
+            subplot_titles=(
+                "Price, MAs, VWMA & Bollinger Bands", 
+                "RSI (Momentum)", 
+                "MACD (Trend)", 
+                "OBV (Money Flow)", 
+                "NVI (Smart Money/Institutional Proxy)", 
+                "ATR (Volatility & Risk)"
+            )
         )
 
-        # 1. Price, SMAs, Fibs
+        # 1. Price, SMAs, VWMA, Fibs, BB
         fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name="Close", line=dict(color="white")), row=1, col=1)
         fig.add_trace(go.Scatter(x=df['Date'], y=df['SMA_20'], name="20-Day SMA", line=dict(color="cyan", width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['SMA_50'], name="50-Day SMA", line=dict(color="orange", width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['Support_60d'], name="60d Support", line=dict(color="red", dash="dash")), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['Resistance_60d'], name="60d Resistance", line=dict(color="green", dash="dash")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['VWMA_20'], name="20-Day VWMA", line=dict(color="#f4d03f", width=2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dash'), name='Upper Band'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dash'), name='Lower Band', fill='tonexty', fillcolor='rgba(128,128,128,0.1)'), row=1, col=1)
         
         colors = ["#ff9999", "#ffcc99", "#ffff99", "#ccff99", "#99ff99", "#99ccff", "#cc99ff"]
         for (level_name, price), color in zip(fib_levels.items(), colors):
@@ -231,35 +280,38 @@ if df is not None:
                 text=[None, f"{level_name}"], textposition="top left", showlegend=False
             ), row=1, col=1)
 
-        # 2. Bollinger Bands
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dash'), name='Upper Band'), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dash'), name='Lower Band', fill='tonexty', fillcolor='rgba(128,128,128,0.2)'), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], line=dict(color='white'), name='Close (BB)'), row=2, col=1)
+        # 2. RSI
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='mediumpurple'), name='RSI'), row=2, col=1)
+        fig.add_hline(y=70, row=2, col=1, line_dash="dash", line_color="red")
+        fig.add_hline(y=30, row=2, col=1, line_dash="dash", line_color="green")
+        fig.update_yaxes(range=[0, 100], row=2, col=1)
 
-        # 3. RSI
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='mediumpurple'), name='RSI'), row=3, col=1)
-        fig.add_hline(y=70, row=3, col=1, line_dash="dash", line_color="red", annotation_text="Overbought")
-        fig.add_hline(y=30, row=3, col=1, line_dash="dash", line_color="green", annotation_text="Oversold")
-        
-        # Set static limits for RSI so it doesn't auto-scale weirdly
-        fig.update_yaxes(range=[0, 100], row=3, col=1)
-
-        # 4. MACD
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['MACD'], line=dict(color='dodgerblue'), name='MACD Line'), row=4, col=1)
-        fig.add_trace(go.Scatter(x=df['Date'], y=df['MACD_Signal'], line=dict(color='darkorange'), name='Signal Line'), row=4, col=1)
+        # 3. MACD
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MACD'], line=dict(color='dodgerblue'), name='MACD Line'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MACD_Signal'], line=dict(color='darkorange'), name='Signal Line'), row=3, col=1)
         macd_colors = ['#2ca02c' if val >= 0 else '#d62728' for val in df['MACD_Hist']]
-        fig.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], marker_color=macd_colors, name='Histogram'), row=4, col=1)
+        fig.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], marker_color=macd_colors, name='Histogram'), row=3, col=1)
+
+        # 4. OBV
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['OBV'], line=dict(color='#3498db'), name='OBV'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['OBV_EMA'], line=dict(color='orange', dash='dot'), name='OBV EMA Signal'), row=4, col=1)
+
+        # 5. NVI (Smart Money)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['NVI'], line=dict(color='#9b59b6'), name='NVI'), row=5, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['NVI_Signal'], line=dict(color='yellow', dash='dot'), name='NVI Signal (255d)'), row=5, col=1)
+
+        # 6. ATR
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['ATR'], line=dict(color='#e74c3c'), name='ATR'), row=6, col=1)
 
         # --- DYNAMIC AXIS & ZOOM STYLING ---
         fig.update_layout(
             template="plotly_dark", 
-            height=1200, 
+            height=1600, # Increased height to fit 6 distinct rows comfortably
             margin=dict(l=0, r=0, t=30, b=0),
             hovermode="x unified",
-            dragmode="zoom"  # Ensures zooming works properly for axes selection
+            dragmode="zoom"
         )
         
-        # Unlock all axes so they can dynamically rescale to zoomed selections
         fig.update_xaxes(fixedrange=False, autorange=True)
         fig.update_yaxes(fixedrange=False, autorange=True)
 
