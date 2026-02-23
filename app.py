@@ -240,6 +240,8 @@ if df is not None:
         fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='mediumpurple'), name='RSI'), row=3, col=1)
         fig.add_hline(y=70, row=3, col=1, line_dash="dash", line_color="red", annotation_text="Overbought")
         fig.add_hline(y=30, row=3, col=1, line_dash="dash", line_color="green", annotation_text="Oversold")
+        
+        # Set static limits for RSI so it doesn't auto-scale weirdly
         fig.update_yaxes(range=[0, 100], row=3, col=1)
 
         # 4. MACD
@@ -248,14 +250,19 @@ if df is not None:
         macd_colors = ['#2ca02c' if val >= 0 else '#d62728' for val in df['MACD_Hist']]
         fig.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], marker_color=macd_colors, name='Histogram'), row=4, col=1)
 
-        # Layout styling
+        # --- DYNAMIC AXIS & ZOOM STYLING ---
         fig.update_layout(
             template="plotly_dark", 
             height=1200, 
             margin=dict(l=0, r=0, t=30, b=0),
-            hovermode="x unified"
+            hovermode="x unified",
+            dragmode="zoom"  # Ensures zooming works properly for axes selection
         )
-        # Prevent secondary charts from clustering up the legend too much if desired, but kept visible for toggling
+        
+        # Unlock all axes so they can dynamically rescale to zoomed selections
+        fig.update_xaxes(fixedrange=False, autorange=True)
+        fig.update_yaxes(fixedrange=False, autorange=True)
+
         st.plotly_chart(fig, use_container_width=True)
         st.divider()
 
@@ -554,4 +561,3 @@ if df is not None:
                     st.info(f"🎯 **Strike Selection (Directional/Debit):** For higher win rate, buy At-The-Money (ATM) near **${current_price:.2f}**. For max theoretical yield (ROI), buy Out-Of-The-Money (OTM) near **${upper_05sd:.2f}** (Calls) or **${lower_05sd:.2f}** (Puts).")
 else:
     st.error("Ticker not found.")
-    
