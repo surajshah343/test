@@ -10,6 +10,7 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, f1_score
 from plotly import graph_objs as go
+from plotly.subplots import make_subplots
 import plotly.express as px
 import scipy.stats as stats
 
@@ -81,12 +82,12 @@ def load_and_process(symbol):
     df['Support_60d'] = df['Low'].shift(1).rolling(window=60).min()
     df['Resistance_60d'] = df['High'].shift(1).rolling(window=60).max()
     
-    # --- ADDED: Bollinger Bands ---
+    # Bollinger Bands
     df['Std_20'] = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = df['SMA_20'] + (2 * df['Std_20'])
     df['BB_Lower'] = df['SMA_20'] - (2 * df['Std_20'])
     
-    # --- ADDED: MACD ---
+    # MACD
     df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = df['EMA_12'] - df['EMA_26']
@@ -190,7 +191,7 @@ if df is not None:
     # TAB 1: TECHNICALS & FORECAST
     # ==========================================
     with tab1:
-        st.subheader("Historical Price Action")
+        st.subheader("Synchronized Technical Analysis")
         actual_window = min(fib_window, len(df))
         fib_df = df.tail(actual_window)
         max_price = fib_df['High'].max()
@@ -206,59 +207,57 @@ if df is not None:
             "100.0%": max_price
         }
 
-        fig_hist = go.Figure()
-        fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name="Close", line=dict(color="white")))
-        fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['SMA_20'], name="20-Day SMA", line=dict(color="cyan", width=1)))
-        fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['SMA_50'], name="50-Day SMA", line=dict(color="orange", width=1)))
-        fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Support_60d'], name="60d Support", line=dict(color="red", dash="dash")))
-        fig_hist.add_trace(go.Scatter(x=df['Date'], y=df['Resistance_60d'], name="60d Resistance", line=dict(color="green", dash="dash")))
+        # --- COMBINED SUBPLOTS WITH SHARED X-AXIS ---
+        fig = make_subplots(
+            rows=4, cols=1, 
+            shared_xaxes=True, 
+            vertical_spacing=0.03,
+            row_heights=[0.4, 0.2, 0.2, 0.2],
+            subplot_titles=("Historical Price & Fibonacci", "Bollinger Bands", "RSI", "MACD")
+        )
+
+        # 1. Price, SMAs, Fibs
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name="Close", line=dict(color="white")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['SMA_20'], name="20-Day SMA", line=dict(color="cyan", width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['SMA_50'], name="50-Day SMA", line=dict(color="orange", width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Support_60d'], name="60d Support", line=dict(color="red", dash="dash")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Resistance_60d'], name="60d Resistance", line=dict(color="green", dash="dash")), row=1, col=1)
         
         colors = ["#ff9999", "#ffcc99", "#ffff99", "#ccff99", "#99ff99", "#99ccff", "#cc99ff"]
         for (level_name, price), color in zip(fib_levels.items(), colors):
-            fig_hist.add_trace(go.Scatter(
+            fig.add_trace(go.Scatter(
                 x=[start_date, end_date], y=[price, price], mode="lines+text",
                 name=f"Fib {level_name}", line=dict(color=color, dash="dot"),
                 text=[None, f"{level_name}"], textposition="top left", showlegend=False
-            ))
+            ), row=1, col=1)
 
-        fig_hist.update_layout(template="plotly_dark", height=600, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig_hist, use_container_width=True)
+        # 2. Bollinger Bands
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dash'), name='Upper Band'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dash'), name='Lower Band', fill='tonexty', fillcolor='rgba(128,128,128,0.2)'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], line=dict(color='white'), name='Close (BB)'), row=2, col=1)
 
-        # --- ADDED: NEW TECHNICAL CHARTS ---
-        
-        # 1. Bollinger Bands
-        st.subheader("Bollinger Bands (20-Day, 2 Std Dev)")
-        fig_bb = go.Figure()
-        fig_bb.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dash'), name='Upper Band'))
-        fig_bb.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dash'), name='Lower Band', fill='tonexty', fillcolor='rgba(128,128,128,0.2)'))
-        fig_bb.add_trace(go.Scatter(x=df['Date'], y=df['Close'], line=dict(color='white'), name='Close'))
-        fig_bb.update_layout(template="plotly_dark", height=400, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig_bb, use_container_width=True)
+        # 3. RSI
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='mediumpurple'), name='RSI'), row=3, col=1)
+        fig.add_hline(y=70, row=3, col=1, line_dash="dash", line_color="red", annotation_text="Overbought")
+        fig.add_hline(y=30, row=3, col=1, line_dash="dash", line_color="green", annotation_text="Oversold")
+        fig.update_yaxes(range=[0, 100], row=3, col=1)
 
-        # 2. RSI
-        st.subheader("RSI (Relative Strength Index)")
-        fig_rsi = go.Figure()
-        fig_rsi.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='mediumpurple'), name='RSI'))
-        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought")
-        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold")
-        fig_rsi.update_layout(template="plotly_dark", height=300, margin=dict(l=0, r=0, t=30, b=0), yaxis_range=[0, 100])
-        st.plotly_chart(fig_rsi, use_container_width=True)
-
-        # 3. MACD
-        st.subheader("MACD (Moving Average Convergence Divergence)")
-        fig_macd = go.Figure()
-        fig_macd.add_trace(go.Scatter(x=df['Date'], y=df['MACD'], line=dict(color='dodgerblue'), name='MACD Line'))
-        fig_macd.add_trace(go.Scatter(x=df['Date'], y=df['MACD_Signal'], line=dict(color='darkorange'), name='Signal Line'))
-        
-        # Histogram colors: green if positive, red if negative
+        # 4. MACD
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MACD'], line=dict(color='dodgerblue'), name='MACD Line'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MACD_Signal'], line=dict(color='darkorange'), name='Signal Line'), row=4, col=1)
         macd_colors = ['#2ca02c' if val >= 0 else '#d62728' for val in df['MACD_Hist']]
-        fig_macd.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], marker_color=macd_colors, name='Histogram'))
-        
-        fig_macd.update_layout(template="plotly_dark", height=400, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig_macd, use_container_width=True)
+        fig.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], marker_color=macd_colors, name='Histogram'), row=4, col=1)
 
+        # Layout styling
+        fig.update_layout(
+            template="plotly_dark", 
+            height=1200, 
+            margin=dict(l=0, r=0, t=30, b=0),
+            hovermode="x unified"
+        )
+        # Prevent secondary charts from clustering up the legend too much if desired, but kept visible for toggling
+        st.plotly_chart(fig, use_container_width=True)
         st.divider()
-        # --- END OF ADDED CHARTS ---
 
         if st.button("🔄 Run AI Model Pipeline & Generate Forecast"):
             features = ['Log_Ret', 'Vol_20', 'RSI']
@@ -555,3 +554,4 @@ if df is not None:
                     st.info(f"🎯 **Strike Selection (Directional/Debit):** For higher win rate, buy At-The-Money (ATM) near **${current_price:.2f}**. For max theoretical yield (ROI), buy Out-Of-The-Money (OTM) near **${upper_05sd:.2f}** (Calls) or **${lower_05sd:.2f}** (Puts).")
 else:
     st.error("Ticker not found.")
+    
