@@ -81,6 +81,18 @@ def load_and_process(symbol):
     df['Support_60d'] = df['Low'].shift(1).rolling(window=60).min()
     df['Resistance_60d'] = df['High'].shift(1).rolling(window=60).max()
     
+    # --- ADDED: Bollinger Bands ---
+    df['Std_20'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['SMA_20'] + (2 * df['Std_20'])
+    df['BB_Lower'] = df['SMA_20'] - (2 * df['Std_20'])
+    
+    # --- ADDED: MACD ---
+    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = df['EMA_12'] - df['EMA_26']
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+    
     return df.dropna().reset_index(drop=True)
 
 @st.cache_data(ttl=86400)
@@ -211,6 +223,42 @@ if df is not None:
 
         fig_hist.update_layout(template="plotly_dark", height=600, margin=dict(l=0, r=0, t=30, b=0))
         st.plotly_chart(fig_hist, use_container_width=True)
+
+        # --- ADDED: NEW TECHNICAL CHARTS ---
+        
+        # 1. Bollinger Bands
+        st.subheader("Bollinger Bands (20-Day, 2 Std Dev)")
+        fig_bb = go.Figure()
+        fig_bb.add_trace(go.Scatter(x=df['Date'], y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dash'), name='Upper Band'))
+        fig_bb.add_trace(go.Scatter(x=df['Date'], y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dash'), name='Lower Band', fill='tonexty', fillcolor='rgba(128,128,128,0.2)'))
+        fig_bb.add_trace(go.Scatter(x=df['Date'], y=df['Close'], line=dict(color='white'), name='Close'))
+        fig_bb.update_layout(template="plotly_dark", height=400, margin=dict(l=0, r=0, t=30, b=0))
+        st.plotly_chart(fig_bb, use_container_width=True)
+
+        # 2. RSI
+        st.subheader("RSI (Relative Strength Index)")
+        fig_rsi = go.Figure()
+        fig_rsi.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], line=dict(color='mediumpurple'), name='RSI'))
+        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought")
+        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold")
+        fig_rsi.update_layout(template="plotly_dark", height=300, margin=dict(l=0, r=0, t=30, b=0), yaxis_range=[0, 100])
+        st.plotly_chart(fig_rsi, use_container_width=True)
+
+        # 3. MACD
+        st.subheader("MACD (Moving Average Convergence Divergence)")
+        fig_macd = go.Figure()
+        fig_macd.add_trace(go.Scatter(x=df['Date'], y=df['MACD'], line=dict(color='dodgerblue'), name='MACD Line'))
+        fig_macd.add_trace(go.Scatter(x=df['Date'], y=df['MACD_Signal'], line=dict(color='darkorange'), name='Signal Line'))
+        
+        # Histogram colors: green if positive, red if negative
+        macd_colors = ['#2ca02c' if val >= 0 else '#d62728' for val in df['MACD_Hist']]
+        fig_macd.add_trace(go.Bar(x=df['Date'], y=df['MACD_Hist'], marker_color=macd_colors, name='Histogram'))
+        
+        fig_macd.update_layout(template="plotly_dark", height=400, margin=dict(l=0, r=0, t=30, b=0))
+        st.plotly_chart(fig_macd, use_container_width=True)
+
+        st.divider()
+        # --- END OF ADDED CHARTS ---
 
         if st.button("🔄 Run AI Model Pipeline & Generate Forecast"):
             features = ['Log_Ret', 'Vol_20', 'RSI']
