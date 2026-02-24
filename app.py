@@ -40,8 +40,9 @@ class MacroFactorModel:
         self.factors = factors
 
     def compute_factor_exposures(self, returns):
-        # Still simulated for demo, but now sized to actual live data shape
-        exposures = pd.DataFrame(np.random.randn(*returns.shape), columns=self.factors)
+        # Fix: The shape must be (number of assets, number of factors)
+        num_assets = returns.shape[1] if len(returns.shape) > 1 else 1
+        exposures = pd.DataFrame(np.random.randn(num_assets, len(self.factors)), columns=self.factors)
         return exposures
 
 # ------------------------
@@ -158,7 +159,6 @@ with tab1:
         transformer = TransformerAlpha()
         alphas = transformer.predict(returns_array)
         alpha_df = pd.DataFrame(alphas[-10:], columns=tickers, index=returns_df.index[-10:]) 
-        # Removed the background gradient to fix Matplotlib import error
         st.dataframe(alpha_df, use_container_width=True)
         
     with col2:
@@ -188,14 +188,11 @@ with tab2:
         factor_model = MacroFactorModel(factors)
         exposures = factor_model.compute_factor_exposures(returns_df)
         exposures.index = tickers
-        # Removed the background gradient to fix Matplotlib import error
         st.dataframe(exposures, use_container_width=True)
         
     with col2:
         st.subheader("DuPont Analysis (Proxies)")
         st.write("Decomposition of Return on Equity (ROE)")
-        # Note: Live fundamental data requires multiple API calls, so we generate visually 
-        # coherent proxies bound to your specific tickers for UI continuity.
         dupont_data = {
             "Asset": tickers,
             "Net Margin (%)": np.random.uniform(5, 25, num_assets).round(2),
@@ -218,7 +215,6 @@ with tab3:
         st.subheader("Live Risk Parity Weights")
         cov_matrix = np.cov(returns_array.T)
         
-        # Handle 1D edge case if only 1 ticker is entered
         if num_assets == 1:
             weights = np.array([1.0])
         else:
@@ -232,7 +228,6 @@ with tab3:
         st.subheader("Kelly Criterion Sizer (Daily Vol)")
         kelly = KellySizer()
         
-        # Kelly fractions using actual live daily returns
         kelly_fractions = []
         for i in range(num_assets):
             if num_assets == 1:
@@ -250,7 +245,6 @@ with tab3:
 with tab4:
     st.header(f"Heston Stochastic Volatility Model ({tickers[0]})")
     
-    # Extract the last actual closing price of the first ticker
     latest_price = prices_df.iloc[-1, 0] if num_assets > 1 else prices_df.iloc[-1]
     
     st.markdown(f"Monte Carlo simulation paths starting from latest live price: **${latest_price:.2f}**")
@@ -260,7 +254,6 @@ with tab4:
     num_paths = st.slider("Number of Monte Carlo Paths", 1, 10, 5)
     sim_paths = {}
     for i in range(num_paths):
-        # Using real S0
         sim_paths[f"Path_{i+1}"] = heston.simulate(S0=latest_price)
         
     st.line_chart(pd.DataFrame(sim_paths))
@@ -278,7 +271,6 @@ with tab5:
             optimizer = BayesianOptimizer(param_space)
             
             def dummy_objective(params):
-                # In production, this would test against actual returns_array
                 return np.random.rand()
             
             best_params, best_score = optimizer.optimize(dummy_objective, n_iter=5)
