@@ -143,26 +143,31 @@ class HestonMonteCarlo:
 class TransformerAlpha(nn.Module):
     def __init__(self, input_dim=1, d_model=64, n_heads=4, n_layers=2, dropout=0.1):
         super().__init__()
+        # input_dim represents the number of assets.
         self.embedding = nn.Linear(input_dim, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dropout=dropout, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.fc = nn.Linear(d_model, 1)
+        
+        # Output dim matches input dim to generate an alpha for each asset
+        self.fc = nn.Linear(d_model, input_dim)
 
     def predict(self, X):
-        # Convert numpy array to sequence tensor [Batch, SeqLen, Features]
         self.eval()
         with torch.no_grad():
-            x_tensor = torch.FloatTensor(X).unsqueeze(-1)
-            # Add batch dim if missing
-            if len(x_tensor.shape) == 2:
-                x_tensor = x_tensor.unsqueeze(0)
+            # X comes in as (Days, Assets)
+            # We add a Batch dimension so shape becomes (1, Days, Assets)
+            x_tensor = torch.FloatTensor(X).unsqueeze(0)
             
             emb = self.embedding(x_tensor)
             out = self.transformer(emb)
-            preds = self.fc(out).squeeze(-1).numpy()
-            return preds
+            
+            # preds shape is (1, Days, Assets)
+            preds = self.fc(out)
+            
+            # Squeeze removes the batch dimension returning (Days, Assets)
+            return preds.squeeze(0).numpy()
 
 # ------------------------
 # Forecast Metrics
@@ -226,7 +231,6 @@ if prices_df.empty:
 
 returns_array = returns_df.values
 
-
 # --- TABS LAYOUT ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📈 Technical AI Forecast", 
@@ -245,7 +249,6 @@ with tab1:
         st.header("Transformer Alpha & Microstructure Execution")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            # Added 'r' before quotes for raw string
             st.markdown(r"""
             **Transformer Alpha Model**
             Eliminates traditional sequence recurrence by using self-attention to capture long-range market dependencies.
@@ -298,7 +301,6 @@ with tab2:
         st.header("Fundamental & Macroeconomic Factors")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            # Added 'r' before quotes for raw string
             st.markdown(r"""
             **Macro Factor Model**
             Breaks down asset returns into exposures against broad macroeconomic drivers.
@@ -341,7 +343,6 @@ with tab3:
         st.header("Dynamic Allocation Sizing")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            # Added 'r' before quotes for raw string
             st.markdown(r"""
             **Risk Parity Allocation**
             Equalizes the risk contribution of every asset in the portfolio, avoiding capitalization-weighted concentration.
@@ -392,7 +393,6 @@ with tab4:
         st.header(f"Heston Stochastic Volatility Model ({tickers[0]})")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            # Added 'r' before quotes for raw string to fix the \x error from \xi
             st.markdown(r"""
             **Heston Model**
             A Monte Carlo simulation framework where volatility is not constant, but a stochastic process itself (mean-reverting).
@@ -427,7 +427,6 @@ with tab5:
         st.header("Bayesian Hyperparameter Optimization")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            # Added 'r' before quotes for raw string
             st.markdown(r"""
             **Tree-structured Parzen Estimator (Optuna)**
             Builds a probabilistic surrogate model to select the most promising hyperparameters rather than random guessing.
