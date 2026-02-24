@@ -1,151 +1,93 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-# -------------------------
-# MODULE CLASSES
-# -------------------------
+# Import your modules
+from bayesian_optimizer import BayesianOptimizer
+from kelly import KellySizer
+from factor_model import MacroFactorModel
+from rl_execution import RLExecutionAgent
+from allocator import RiskParityAllocator
+from heston import HestonMonteCarlo
+from transformer_alpha import TransformerAlpha
+from forecast_metrics import ForecastMetrics
 
-# Bayesian Hyperparameter Optimizer
-class BayesianOptimizer:
-    def __init__(self):
-        pass
-    def optimize(self, model, param_space):
-        # placeholder logic
-        return {"best_params": {}}
+# --- Sidebar: Data selection ---
+st.sidebar.header("Portfolio Data")
+uploaded_file = st.sidebar.file_uploader("Upload CSV with asset returns", type=["csv"])
 
-# Kelly-optimal leverage
-class KellySizer:
-    def __init__(self):
-        pass
-    def compute(self, returns):
-        # placeholder logic
-        return 1.0
+if uploaded_file is not None:
+    returns = pd.read_csv(uploaded_file, index_col=0)
+    assets = list(returns.columns)
+    st.subheader("Selected Asset Returns")
+    st.dataframe(returns.head())
+else:
+    # Default random generation
+    asset_list = ["AAPL", "MSFT", "GOOG", "TSLA", "AMZN", "BTC-USD", "ETH-USD"]
+    selected_assets = st.sidebar.multiselect(
+        "Select assets to include", asset_list, default=asset_list[:3]
+    )
+    if not selected_assets:
+        st.warning("Select at least one asset!")
+        st.stop()
+    returns = pd.DataFrame(np.random.randn(100, len(selected_assets)), columns=selected_assets)
+    assets = list(returns.columns)
+    st.subheader("Generated Asset Returns")
+    st.dataframe(returns.head())
 
-# Cross-asset macro factor model
-class MacroFactorModel:
-    def __init__(self):
-        pass
-    def compute_factors(self, data):
-        # placeholder logic
-        return pd.DataFrame({"factor1": [0]})
+# --- Sidebar: Parameters ---
+st.sidebar.header("Simulation Parameters")
+window = st.sidebar.number_input("Lookback window for metrics", min_value=10, max_value=250, value=60)
 
-# Reinforcement learning execution
-class RLExecutionAgent:
-    def __init__(self):
-        pass
-    def execute(self, portfolio):
-        # placeholder logic
-        return portfolio
-
-# Risk-parity allocator
-class RiskParityAllocator:
-    def __init__(self):
-        pass
-    def allocate(self, cov_matrix):
-        n = len(cov_matrix)
-        return np.array([1/n]*n)
-
-# Heston Monte Carlo simulator
-class HestonMonteCarlo:
-    def __init__(self):
-        pass
-    def simulate(self, S0, T, steps):
-        return np.full(steps, S0)
-
-# Transformer Alpha forecasting
-class TransformerAlpha:
-    def __init__(self):
-        pass
-    def forecast(self, data):
-        return np.random.randn(len(data))
-
-# Forecast metrics
-class ForecastMetrics:
-    def __init__(self):
-        pass
-    def accuracy(self, predictions, actuals):
-        return np.mean((predictions - actuals)**2)
-
-# -------------------------
-# STREAMLIT APP
-# -------------------------
-
-st.title("Unified Quantitative Finance Dashboard")
-
-st.sidebar.header("Inputs")
-num_assets = st.sidebar.number_input("Number of Assets", min_value=1, max_value=20, value=5)
-num_steps = st.sidebar.number_input("Simulation Steps", min_value=10, max_value=1000, value=100)
-S0 = st.sidebar.number_input("Initial Price", value=100.0)
-
-# -------------------------
-# SAMPLE DATA
-# -------------------------
-st.subheader("Sample Portfolio Data")
-returns = pd.DataFrame(np.random.randn(100, num_assets), columns=[f"Asset {i+1}" for i in range(num_assets)])
-st.dataframe(returns.head())
-
-# -------------------------
-# BAYESIAN OPTIMIZER
-# -------------------------
-optimizer = BayesianOptimizer()
-best_params = optimizer.optimize(None, None)
-st.subheader("Bayesian Optimizer")
-st.write(best_params)
-
-# -------------------------
-# KELLY SIZER
-# -------------------------
-kelly = KellySizer()
-leverage = kelly.compute(returns.mean())
-st.subheader("Kelly Optimal Leverage")
-st.write(leverage)
-
-# -------------------------
-# MACRO FACTOR MODEL
-# -------------------------
-factor_model = MacroFactorModel()
-factors = factor_model.compute_factors(returns)
-st.subheader("Macro Factors")
-st.dataframe(factors.head())
-
-# -------------------------
-# RISK-PARITY ALLOCATION
-# -------------------------
-allocator = RiskParityAllocator()
-cov_matrix = returns.cov()
-weights = allocator.allocate(cov_matrix)
-st.subheader("Risk-Parity Allocation")
-st.write(weights)
-
-# -------------------------
-# HESTON MONTE CARLO
-# -------------------------
-heston = HestonMonteCarlo()
-sim_prices = heston.simulate(S0, T=1, steps=num_steps)
-st.subheader("Heston Monte Carlo Simulation")
-st.line_chart(sim_prices)
-
-# -------------------------
-# TRANSFORMER FORECAST
-# -------------------------
+# --- Step 1: Forecasting ---
+st.header("Forecasting & Alpha Signals")
 transformer = TransformerAlpha()
-forecast = transformer.forecast(returns)
-st.subheader("Transformer Alpha Forecast")
-st.line_chart(forecast)
+forecasted_returns = transformer.predict(returns)  # assume method returns a DataFrame
+st.write("Forecasted returns (first 5 rows):")
+st.dataframe(forecasted_returns.head())
 
-# -------------------------
-# FORECAST METRICS
-# -------------------------
+# --- Step 2: Risk Model ---
+st.header("Risk Model")
+factor_model = MacroFactorModel()
+factor_cov = factor_model.fit(forecasted_returns)
+st.write("Factor covariance matrix:")
+st.dataframe(factor_cov)
+
+# --- Step 3: Portfolio Allocation ---
+st.header("Portfolio Allocation")
+# Bayesian optimization of hyperparameters for allocation
+optimizer = BayesianOptimizer()
+opt_params = optimizer.optimize(forecasted_returns)
+
+# Kelly optimal sizing
+kelly = KellySizer()
+kelly_weights = kelly.compute(forecasted_returns)
+
+# Risk parity allocation
+allocator = RiskParityAllocator()
+risk_parity_weights = allocator.allocate(forecasted_returns)
+
+st.subheader("Optimized Weights")
+weights_df = pd.DataFrame({
+    "Kelly": kelly_weights,
+    "Risk Parity": risk_parity_weights
+}, index=assets)
+st.dataframe(weights_df)
+
+# --- Step 4: Backtesting ---
+st.header("Backtesting & Performance Metrics")
+heston_model = HestonMonteCarlo()
+simulated_prices = heston_model.simulate(returns)
+
 metrics = ForecastMetrics()
-accuracy = metrics.accuracy(forecast, returns.iloc[:, 0].values[:len(forecast)])
-st.subheader("Forecast Accuracy (MSE)")
-st.write(accuracy)
+performance = metrics.evaluate(simulated_prices, weights_df["Kelly"])
+st.write("Performance Metrics for Kelly Portfolio:")
+st.dataframe(performance)
 
-# -------------------------
-# RL EXECUTION
-# -------------------------
+# --- Step 5: Reinforcement Learning Execution ---
+st.header("Execution Simulation")
 rl_agent = RLExecutionAgent()
-executed_portfolio = rl_agent.execute(weights)
-st.subheader("Reinforcement Learning Executed Portfolio")
-st.write(executed_portfolio)
+executed_trades = rl_agent.simulate_trades(weights_df["Kelly"], simulated_prices)
+st.write("Executed Trades Sample:")
+st.dataframe(executed_trades.head())
