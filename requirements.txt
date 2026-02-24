@@ -12,4 +12,4 @@ requests
 optuna
 matplotlib
 alpaca_trade_api
-alpaca-trade-api
+alpaca-py
