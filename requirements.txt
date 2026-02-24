@@ -10,6 +10,4 @@ xgboost
 scikit-learn
 requests
 optuna
-git add .
-git commit -m "Added institutional modules"
-git push
+
