@@ -226,14 +226,6 @@ if prices_df.empty:
 
 returns_array = returns_df.values
 
-# --- TABS LAYOUT ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Technical AI Forecast", 
-    "🏢 Deep Value & DuPont", 
-    "⚖️ Portfolio & Risk", 
-    "🎲 Options & MC",
-    "⚙️ System Optimization"
-])
 
 # --- TABS LAYOUT ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
