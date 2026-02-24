@@ -6,6 +6,3 @@ from allocator import RiskParityAllocator
 from heston import HestonMonteCarlo
 from transformer_alpha import TransformerAlpha
 from forecast_metrics import ForecastMetrics
-git add .
-git commit -m "Fixed root-level imports"
-git push
