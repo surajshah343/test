@@ -158,7 +158,8 @@ with tab1:
         transformer = TransformerAlpha()
         alphas = transformer.predict(returns_array)
         alpha_df = pd.DataFrame(alphas[-10:], columns=tickers, index=returns_df.index[-10:]) 
-        st.dataframe(alpha_df.style.background_gradient(cmap='RdYlGn'), use_container_width=True)
+        # Removed the background gradient to fix Matplotlib import error
+        st.dataframe(alpha_df, use_container_width=True)
         
     with col2:
         st.subheader("RL Agent Execution")
@@ -187,7 +188,8 @@ with tab2:
         factor_model = MacroFactorModel(factors)
         exposures = factor_model.compute_factor_exposures(returns_df)
         exposures.index = tickers
-        st.dataframe(exposures.style.background_gradient(cmap='Blues'), use_container_width=True)
+        # Removed the background gradient to fix Matplotlib import error
+        st.dataframe(exposures, use_container_width=True)
         
     with col2:
         st.subheader("DuPont Analysis (Proxies)")
