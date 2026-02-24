@@ -45,17 +45,25 @@ class MacroFactorModel:
         self.model = LinearRegression()
 
     def compute_factor_exposures(self, returns_df, macro_returns_df):
-        aligned_data = pd.concat([returns_df, macro_returns_df], axis=1).dropna()
+        # Add a suffix to macro columns to prevent name collisions (e.g., if 'SPY' is in both)
+        macro_safe = macro_returns_df.add_suffix('_MACRO')
+        
+        # Align indices to ensure accurate regression
+        aligned_data = pd.concat([returns_df, macro_safe], axis=1).dropna()
         if aligned_data.empty:
             return pd.DataFrame()
+            
+        # Separate back into X and Y safely
         y_data = aligned_data[returns_df.columns]
-        x_data = aligned_data[macro_returns_df.columns]
+        x_data = aligned_data[macro_safe.columns]
         
         exposures = []
-        for col in y_data.columns:
-            self.model.fit(x_data, y_data[col])
+        # Iterate through columns using integer position to completely bypass any duplicate naming issues
+        for i in range(y_data.shape[1]):
+            self.model.fit(x_data, y_data.iloc[:, i])
             exposures.append(self.model.coef_)
-        return pd.DataFrame(exposures, columns=self.factors, index=y_data.columns)
+            
+        return pd.DataFrame(exposures, columns=self.factors, index=returns_df.columns)
 
 class TransformerAlpha(nn.Module):
     def __init__(self, input_dim=1, d_model=64, n_heads=4, n_layers=2, dropout=0.1):
