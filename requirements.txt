@@ -11,5 +11,9 @@ scikit-learn
 requests
 optuna
 matplotlib
-alpaca_trade_api
 alpaca-py
+streamlit
+pandas<3.0.0
+urllib3>=2.0.0
+requests>=2.31.0
+
