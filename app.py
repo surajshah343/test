@@ -12,7 +12,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from typing import Tuple, Dict, Callable
 import datetime
-import alpaca_trade_api as tradeapi
+import alpacatrade_api as tradeapi
 
 # ==========================================
 # BACKEND CLASSES & ML MODELS
