@@ -12,7 +12,9 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from typing import Tuple, Dict, Callable
 import datetime
-import alpacatrade_api as tradeapi
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 # ==========================================
 # BACKEND CLASSES & ML MODELS
@@ -464,16 +466,22 @@ with tab6:
         col_api1, col_api2 = st.columns(2)
         api_key = col_api1.text_input("Alpaca API Key", type="password")
         api_secret = col_api2.text_input("Alpaca Secret Key", type="password")
-        base_url = st.text_input("Base URL", "https://paper-api.alpaca.markets")
+        # Base URL is handled automatically by alpaca-py based on the paper=True flag
 
     if st.button("Authenticate & Check Buying Power"):
         if api_key and api_secret:
             try:
-                api = tradeapi.REST(api_key, api_secret, base_url, api_version='v2')
-                account = api.get_account()
-                st.success("Successfully Connected to Alpaca!")
-                st.metric("Paper Buying Power", f"${float(account.buying_power):,.2f}")
-                st.session_state['alpaca_api'] = api
+                # Initialize the modern Alpaca Trading Client
+                trading_client = TradingClient(api_key, api_secret, paper=True)
+                account = trading_client.get_account()
+                
+                if account.trading_blocked:
+                    st.error("Account is currently restricted from trading.")
+                else:
+                    st.success("Successfully Connected to Alpaca!")
+                    st.metric("Paper Buying Power", f"${float(account.buying_power):,.2f}")
+                    st.session_state['trading_client'] = trading_client
+                    st.session_state['account_equity'] = float(account.equity)
             except Exception as e:
                 st.error(f"Authentication Failed: {e}")
         else:
@@ -483,7 +491,6 @@ with tab6:
     if 'latest_signals' in st.session_state and 'kelly_weights' in st.session_state:
         st.write("Ready to execute latest AI signals using Kelly Fractions for position sizing.")
         
-        # Combine signals, tickers, and sizing into an actionable dataframe
         action_df = pd.DataFrame({
             "Asset": tickers,
             "AI Action (1=Buy, -1=Sell)": st.session_state['latest_signals'],
@@ -492,10 +499,9 @@ with tab6:
         st.dataframe(action_df, use_container_width=True)
         
         if st.button("Execute Paper Trades", type="primary", use_container_width=True):
-            if 'alpaca_api' in st.session_state:
-                api = st.session_state['alpaca_api']
-                account = api.get_account()
-                equity = float(account.equity)
+            if 'trading_client' in st.session_state:
+                trading_client = st.session_state['trading_client']
+                equity = st.session_state['account_equity']
                 
                 with st.spinner("Submitting orders to Alpaca..."):
                     for index, row in action_df.iterrows():
@@ -504,24 +510,25 @@ with tab6:
                         risk_frac = row['Suggested Portfolio Risk Fraction']
                         
                         if action == 1.0 and risk_frac > 0:
-                            # Calculate dollar amount to allocate based on Kelly
-                            target_notional = equity * min(risk_frac, 0.20) # Cap at 20% max per trade
+                            target_notional = equity * min(risk_frac, 0.20)
+                            
+                            # Construct the order request using the modern schema
+                            market_order_data = MarketOrderRequest(
+                                symbol=symbol,
+                                notional=target_notional,
+                                side=OrderSide.BUY,
+                                time_in_force=TimeInForce.DAY
+                            )
+                            
                             try:
-                                api.submit_order(
-                                    symbol=symbol,
-                                    notional=target_notional,
-                                    side='buy',
-                                    type='market',
-                                    time_in_force='day'
-                                )
+                                trading_client.submit_order(order_data=market_order_data)
                                 st.success(f"Submitted BUY order for {symbol} (${target_notional:.2f})")
                             except Exception as e:
                                 st.error(f"Failed to buy {symbol}: {e}")
                                 
                         elif action == -1.0:
                             try:
-                                # Simple liquidate if selling
-                                api.close_position(symbol)
+                                trading_client.close_position(symbol_or_asset_id=symbol)
                                 st.success(f"Submitted SELL/CLOSE order for {symbol}")
                             except Exception as e:
                                 st.info(f"No existing position to sell for {symbol}")
