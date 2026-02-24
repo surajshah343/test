@@ -235,6 +235,15 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "⚙️ System Optimization"
 ])
 
+# --- TABS LAYOUT ---
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📈 Technical AI Forecast", 
+    "🏢 Deep Value & DuPont", 
+    "⚖️ Portfolio & Risk", 
+    "🎲 Options & MC",
+    "⚙️ System Optimization"
+])
+
 # ---------------------------------------------------------
 # TAB 1: TECHNICAL AI FORECAST
 # ---------------------------------------------------------
@@ -244,7 +253,8 @@ with tab1:
         st.header("Transformer Alpha & Microstructure Execution")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            st.markdown("""
+            # Added 'r' before quotes for raw string
+            st.markdown(r"""
             **Transformer Alpha Model**
             Eliminates traditional sequence recurrence by using self-attention to capture long-range market dependencies.
             
@@ -296,7 +306,8 @@ with tab2:
         st.header("Fundamental & Macroeconomic Factors")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            st.markdown("""
+            # Added 'r' before quotes for raw string
+            st.markdown(r"""
             **Macro Factor Model**
             Breaks down asset returns into exposures against broad macroeconomic drivers.
             
@@ -338,7 +349,8 @@ with tab3:
         st.header("Dynamic Allocation Sizing")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            st.markdown("""
+            # Added 'r' before quotes for raw string
+            st.markdown(r"""
             **Risk Parity Allocation**
             Equalizes the risk contribution of every asset in the portfolio, avoiding capitalization-weighted concentration.
             * **Formula:** $$ RC_i = w_i (\Sigma w)_i $$
@@ -388,7 +400,8 @@ with tab4:
         st.header(f"Heston Stochastic Volatility Model ({tickers[0]})")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            st.markdown("""
+            # Added 'r' before quotes for raw string to fix the \x error from \xi
+            st.markdown(r"""
             **Heston Model**
             A Monte Carlo simulation framework where volatility is not constant, but a stochastic process itself (mean-reverting).
             
@@ -422,7 +435,8 @@ with tab5:
         st.header("Bayesian Hyperparameter Optimization")
     with col_pop:
         with st.popover("ℹ️ Info & Math"):
-            st.markdown("""
+            # Added 'r' before quotes for raw string
+            st.markdown(r"""
             **Tree-structured Parzen Estimator (Optuna)**
             Builds a probabilistic surrogate model to select the most promising hyperparameters rather than random guessing.
             
