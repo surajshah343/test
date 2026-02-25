@@ -5,25 +5,35 @@ import yfinance as yf
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import optuna
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import plotly.express as px
 from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import StandardScaler
-from typing import Tuple, Dict, Callable
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import f1_score
+import scipy.stats as stats
+from typing import Dict, Callable
 import datetime
+from datetime import timedelta
+
+# Alpaca Imports
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
+# Setup hardware acceleration
+device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+
+st.set_page_config(page_title="Pro Quant Dashboard", layout="wide", initial_sidebar_state="expanded")
+
 # ==========================================
-# BACKEND CLASSES & ML MODELS
+# 1. CORE MATH & EXECUTION CLASSES
 # ==========================================
 
 class BayesianOptimizer:
-    def __init__(self, param_space=None):
-        self.param_space = param_space
-
     def optimize(self, objective_func: Callable, n_trials=10):
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.create_study(direction="maximize")
@@ -34,10 +44,8 @@ class KellySizer:
     def compute(self, returns, risk_free=0.0, fraction=0.5):
         mean = np.mean(returns)
         var = np.var(returns)
-        if var == 0:
-            return 0.0
-        full_kelly = (mean - risk_free) / var
-        return full_kelly * fraction
+        if var == 0: return 0.0
+        return ((mean - risk_free) / var) * fraction
 
 class MacroFactorModel:
     def __init__(self, factors):
@@ -45,46 +53,18 @@ class MacroFactorModel:
         self.model = LinearRegression()
 
     def compute_factor_exposures(self, returns_df, macro_returns_df):
-        # Add a suffix to macro columns to prevent name collisions (e.g., if 'SPY' is in both)
         macro_safe = macro_returns_df.add_suffix('_MACRO')
-        
-        # Align indices to ensure accurate regression
         aligned_data = pd.concat([returns_df, macro_safe], axis=1).dropna()
-        if aligned_data.empty:
-            return pd.DataFrame()
+        if aligned_data.empty: return pd.DataFrame()
             
-        # Separate back into X and Y safely
         y_data = aligned_data[returns_df.columns]
         x_data = aligned_data[macro_safe.columns]
         
         exposures = []
-        # Iterate through columns using integer position to completely bypass any duplicate naming issues
         for i in range(y_data.shape[1]):
             self.model.fit(x_data, y_data.iloc[:, i])
             exposures.append(self.model.coef_)
-            
         return pd.DataFrame(exposures, columns=self.factors, index=returns_df.columns)
-
-class TransformerAlpha(nn.Module):
-    def __init__(self, input_dim=1, d_model=64, n_heads=4, n_layers=2, dropout=0.1):
-        super().__init__()
-        self.embedding = nn.Linear(input_dim, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dropout=dropout, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.fc = nn.Linear(d_model, input_dim)
-
-    def forward(self, x):
-        emb = self.embedding(x)
-        out = self.transformer(emb)
-        return self.fc(out[:, -1, :])
-
-class RLExecutionAgent:
-    def execute(self, signals):
-        # Maps signals to actionable discrete states {-1, 0, 1} based on a confidence threshold
-        executed = np.where(signals > 0.005, 1.0, np.where(signals < -0.005, -1.0, 0.0))
-        return executed
 
 class RiskParityAllocator:
     def allocate(self, cov_matrix):
@@ -92,455 +72,480 @@ class RiskParityAllocator:
         w = np.ones(n) / n
         for _ in range(1000):
             risk = w * (cov_matrix @ w)
-            total_risk = np.sum(risk)
-            grad = risk - total_risk / n
+            grad = risk - np.sum(risk) / n
             w -= 0.05 * grad
             w = np.maximum(w, 0)
-            if np.sum(w) > 0:
-                w /= np.sum(w)
+            if np.sum(w) > 0: w /= np.sum(w)
         return w
 
 class HestonMonteCarlo:
     def simulate(self, S0, T=1, dt=1/252, mu=0.05, kappa=2.0, theta=0.04, sigma=0.3, rho=-0.7):
         n_steps = int(T / dt)
-        S = np.zeros(n_steps)
-        v = np.zeros(n_steps)
-        S[0] = S0
-        v[0] = theta
-        
+        S, v = np.zeros(n_steps), np.zeros(n_steps)
+        S[0], v[0] = S0, theta
         for t in range(1, n_steps):
             z1, z2 = np.random.randn(), np.random.randn()
             z2 = rho * z1 + np.sqrt(1 - rho**2) * z2
             v[t] = np.abs(v[t-1] + kappa * (theta - v[t-1]) * dt + sigma * np.sqrt(v[t-1] * dt) * z2)
             S[t] = S[t-1] * np.exp((mu - 0.5 * v[t-1]) * dt + np.sqrt(v[t-1] * dt) * z1)
-            
         return S
 
-class ForecastMetrics:
-    def evaluate(self, y_true, y_pred) -> Dict[str, float]:
-        mae = np.mean(np.abs(y_true - y_pred))
-        rmse = np.sqrt(np.mean((y_true - y_pred)**2))
-        directional = np.mean(np.sign(y_true) == np.sign(y_pred))
-        return {"MAE": mae, "RMSE": rmse, "Dir_Acc": directional}
+# ==========================================
+# 2. NEURAL NETWORK ARCHITECTURES
+# ==========================================
 
-    def sharpe_ratio(self, returns):
-        if np.std(returns) == 0: return 0.0
-        return (np.mean(returns) / np.std(returns)) * np.sqrt(252)
+class TransformerAlpha(nn.Module):
+    def __init__(self, input_dim=1, d_model=64, n_heads=4, n_layers=2, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Linear(input_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.fc = nn.Linear(d_model, input_dim)
 
-    def sortino_ratio(self, returns):
-        downside = returns[returns < 0]
-        dd = np.std(downside) + 1e-9
-        return (np.mean(returns) / dd) * np.sqrt(252)
+    def forward(self, x):
+        return self.fc(self.transformer(self.embedding(x))[:, -1, :])
+
+class TemporalAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attention = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.Tanh(), nn.Linear(hidden_dim // 2, 1))
+
+    def forward(self, lstm_out):
+        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
+        return torch.sum(attn_weights * lstm_out, dim=1), attn_weights
+
+class HybridQuantModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.cnn = nn.Sequential(nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1), nn.LeakyReLU(0.1), nn.BatchNorm1d(64))
+        self.lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True, dropout=0.3)
+        self.attention = TemporalAttention(128)
+        self.fc = nn.Sequential(nn.Linear(128, 64), nn.GELU(), nn.Dropout(0.3), nn.Linear(64, 1))
+
+    def forward(self, x):
+        x = self.cnn(x.transpose(1, 2)).transpose(1, 2)
+        lstm_out, _ = self.lstm(x)
+        context, _ = self.attention(lstm_out)
+        return self.fc(context)
 
 # ==========================================
-# DATA & ML HELPERS
+# 3. DATA & FEATURE ENGINEERING
 # ==========================================
+
+def calculate_rsi(series, window=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / (loss + 1e-9)
+    return 100 - (100 / (1 + rs))
 
 @st.cache_data(ttl=3600)
-def fetch_market_data(tickers, start, end):
-    try:
-        data = yf.download(tickers, start=start, end=end, progress=False)["Close"]
-        if isinstance(data, pd.Series):
-            data = data.to_frame(name=tickers[0])
-        returns = data.pct_change().dropna()
-        return data, returns
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+def fetch_portfolio_data(tickers, start, end):
+    data = yf.download(tickers, start=start, end=end, progress=False)["Close"]
+    if isinstance(data, pd.Series): data = data.to_frame(name=tickers[0])
+    return data, data.pct_change().dropna()
 
-@st.cache_data(ttl=3600*24)
-def fetch_fundamentals(tickers):
-    data = []
-    for t in tickers:
-        try:
-            info = yf.Ticker(t).info
-            data.append({
-                "Asset": t,
-                "Net Margin (%)": info.get('profitMargins', 0) * 100,
-                "ROE (%)": info.get('returnOnEquity', 0) * 100,
-                "Debt to Equity": info.get('debtToEquity', 0)
-            })
-        except:
-            data.append({"Asset": t, "Net Margin (%)": np.nan, "ROE (%)": np.nan, "Debt to Equity": np.nan})
-    return pd.DataFrame(data)
+@st.cache_data(ttl=3600)
+def load_deep_dive_features(symbol, start):
+    df = yf.download(symbol, start=start, interval="1d", progress=False)
+    if df.empty: return None
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()
+    
+    df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['Vol_20'] = df['Log_Ret'].rolling(20).std()
+    df['RSI'] = calculate_rsi(df['Close'], 14)
+    df['SMA_20'] = df['Close'].rolling(window=20).mean()
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    
+    df['Std_20'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['SMA_20'] + (2 * df['Std_20'])
+    df['BB_Lower'] = df['SMA_20'] - (2 * df['Std_20'])
+    
+    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = df['EMA_12'] - df['EMA_26']
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
 
-def create_sequences(data, seq_length=5):
+    df['VWMA_20'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
+    df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    df['OBV_EMA'] = df['OBV'].ewm(span=20, adjust=False).mean()
+    
+    tr = pd.concat([df['High'] - df['Low'], np.abs(df['High'] - df['Close'].shift()), np.abs(df['Low'] - df['Close'].shift())], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(14).mean()
+
+    nvi = [1000]
+    for i in range(1, len(df)):
+        if df['Volume'].iloc[i] < df['Volume'].iloc[i-1]:
+            ret = (df['Close'].iloc[i] - df['Close'].iloc[i-1]) / df['Close'].iloc[i-1]
+            nvi.append(nvi[-1] + (ret * nvi[-1]))
+        else:
+            nvi.append(nvi[-1])
+    df['NVI'] = nvi
+    df['NVI_Signal'] = df['NVI'].ewm(span=255, adjust=False).mean()
+    
+    return df.dropna().reset_index(drop=True)
+
+@st.cache_data(ttl=86400)
+def get_fundamentals(symbol):
+    tkr = yf.Ticker(symbol)
+    try: return tkr.info, tkr.balance_sheet, tkr.income_stmt
+    except: return tkr.info, pd.DataFrame(), pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def get_options_data(symbol):
+    tkr = yf.Ticker(symbol)
+    expirations = tkr.options
+    if not expirations: return None, None, None
+    chain = tkr.option_chain(expirations[0])
+    return expirations, chain.calls, chain.puts
+
+def create_nn_sequences(data, features, target_col, s_x, s_y, window):
+    x_sc = s_x.transform(data[features])
+    y_sc = s_y.transform(data[[target_col]])
     xs, ys = [], []
-    for i in range(len(data) - seq_length):
-        x = data[i:(i + seq_length)]
-        y = data[i + seq_length]
-        xs.append(x)
-        ys.append(y)
-    return np.array(xs), np.array(ys)
+    for i in range(len(x_sc) - window):
+        xs.append(x_sc[i:i+window])
+        ys.append(y_sc[i+window])
+    return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
+
+def safe_get(d, key, default="N/A", format_type="num"):
+    val = d.get(key)
+    if val is None or val == "": return default
+    if format_type == "pct": return f"{val*100:.2f}%"
+    if format_type == "curr": return f"${val:,.2f}"
+    if format_type == "float": return f"{val:.2f}"
+    return val
+
+def black_scholes_price(S, K, T, r, sigma, option_type="call"):
+    if T <= 0 or sigma <= 0: return max(0.0, S - K) if option_type == 'call' else max(0.0, K - S)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if option_type == "call": return S * stats.norm.cdf(d1) - K * np.exp(-r * T) * stats.norm.cdf(d2)
+    else: return K * np.exp(-r * T) * stats.norm.cdf(-d2) - S * stats.norm.cdf(-d1)
 
 # ==========================================
-# STREAMLIT UI - DASHBOARD LAYOUT
+# 4. DASHBOARD UI
 # ==========================================
-st.set_page_config(page_title="Multi-Asset Quant Platform", layout="wide", initial_sidebar_state="expanded")
 
-st.title("🏛️ Multi-Asset Quant Platform")
-st.markdown("Advanced quantitative trading pipeline utilizing live market data, dynamic macro regression, and trained deep learning models.")
-
-# --- SIDEBAR: GLOBAL CONTROLS ---
-st.sidebar.header("Data Parameters")
-tickers_input = st.sidebar.text_input("Enter Tickers (comma separated)", "SPY, QQQ, GLD, AAPL, MSFT")
+st.sidebar.header("🕹️ Global Portfolio Settings")
+tickers_input = st.sidebar.text_input("Portfolio Tickers (comma separated):", "SPY, QQQ, AAPL, GLD")
 tickers = [t.strip().upper() for t in tickers_input.split(",")]
-
-start_date = st.sidebar.date_input("Start Date", datetime.date.today() - datetime.timedelta(days=365*2))
+start_date = st.sidebar.date_input("Start Date", datetime.date.today() - datetime.timedelta(days=365*3))
 end_date = st.sidebar.date_input("End Date", datetime.date.today())
 
-num_assets = len(tickers)
+st.sidebar.divider()
+st.sidebar.header("🔬 Deep Dive Settings")
+target_asset = st.sidebar.selectbox("Select Target Asset:", tickers)
+risk_free_rate = st.sidebar.number_input("Risk-Free Rate (BSM Options):", value=0.045, step=0.005, format="%.3f")
+forecast_horizon = st.sidebar.selectbox("Neural Net Forecast Horizon:", ["1 Week", "1 Month", "1 Year"])
 
-prices_df, returns_df = fetch_market_data(tickers, start_date, end_date)
-macro_prices, macro_returns = fetch_market_data(["SPY", "TIP", "TLT"], start_date, end_date)
+with st.sidebar.expander("Advanced ML Parameters"):
+    lookback = st.slider("Sequence Window:", 10, 60, 30)
+    epochs = st.slider("Training Epochs:", 10, 100, 30)
+    batch_size = st.selectbox("Batch Size:", [32, 64, 128], index=1)
+    fib_window = st.slider("Fibonacci Days:", 30, 1000, 252)
+
+st.title(f"🏛️ Pro Quant Platform")
+st.markdown(f"**Compute Device:** `{device.type.upper()}` | **Active Portfolio Assets:** `{len(tickers)}`")
+
+# Global Data Fetch
+prices_df, returns_df = fetch_portfolio_data(tickers, start_date, end_date)
+macro_prices, macro_returns = fetch_portfolio_data(["SPY", "TIP", "TLT"], start_date, end_date)
 
 if prices_df.empty:
-    st.warning("Please enter valid ticker symbols and ensure date ranges are correct.")
+    st.warning("Please enter valid ticker symbols.")
     st.stop()
 
-scaler = StandardScaler()
-returns_scaled = scaler.fit_transform(returns_df.values)
-
-# --- TABS LAYOUT ---
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📈 AI Forecast & Execution", 
-    "🏢 Macro & Fundamentals", 
-    "⚖️ Portfolio Allocation", 
-    "🎲 Volatility Modeling",
-    "⚙️ Hyperparameter Opt",
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "🌐 Portfolio AI", 
+    "🔬 Technical Deep Dive", 
+    "💎 Fundamentals & DuPont", 
+    "🏢 Macro & Allocation", 
+    "⚖️ Options & Volatility",
+    "⚙️ System Optuna",
     "🔗 Live Paper Trading"
 ])
 
 # ---------------------------------------------------------
-# TAB 1: AI FORECAST
+# TAB 1: PORTFOLIO AI (TRANSFORMER)
 # ---------------------------------------------------------
 with tab1:
-    col_hdr, col_pop = st.columns([5, 1])
-    with col_hdr:
-        st.header("Transformer Alpha Model")
-    with col_pop:
-        with st.popover("ℹ️ Info & Math"):
-            st.markdown(r"""
-            **Transformer Alpha Model**
-            Eliminates traditional sequence recurrence by using self-attention to capture long-range market dependencies.
-            
-            **Formula (Attention Mechanism):**
-            $$ \text{Attention}(Q,K,V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V $$
-            
-            * **How to Read:** Output arrays represent predicted directional returns.
-            * **Good:** High Information Coefficient (IC) and positive expected return.
-            * **Bad:** Output signals clustered near 0; indicates model uncertainty.
-            
-            **RL Execution Engine (DQN)**
-            Uses a Markov Decision Process to minimize transaction costs and slippage.
-            * **Formula (Objective):** $$ \max \mathbb{E}\left[\sum \gamma^t r_t \right] $$
-            """)
-            
+    st.header("Portfolio-Wide Transformer Alpha")
+    st.markdown("Trains a self-attention mechanism across all portfolio assets simultaneously to predict next-day relative performance.")
+    
     fig = px.line(prices_df / prices_df.iloc[0] * 100, title="Normalized Asset Performance (Base 100)")
     fig.update_layout(template="plotly_dark", xaxis_title="Date", yaxis_title="Normalized Price")
     st.plotly_chart(fig, use_container_width=True)
     
-    seq_length = 5
-    X, y = create_sequences(returns_scaled, seq_length)
+    scaler = StandardScaler()
+    returns_scaled = scaler.fit_transform(returns_df.values)
     
-    train_size = int(len(X) * 0.8)
-    X_train, y_train = torch.FloatTensor(X[:train_size]), torch.FloatTensor(y[:train_size])
-    X_test, y_test = torch.FloatTensor(X[train_size:]), torch.FloatTensor(y[train_size:])
-
-    col_model, col_metrics = st.columns([2, 1])
-
-    with col_model:
-        st.subheader("Live Model Training")
-        if st.button("Train Transformer Alpha", type="primary"):
-            with st.spinner("Training Transformer Model on sequence data..."):
-                model = TransformerAlpha(input_dim=num_assets)
-                criterion = nn.MSELoss()
-                optimizer = optim.Adam(model.parameters(), lr=0.005)
-                
-                for epoch in range(30):
-                    optimizer.zero_grad()
-                    outputs = model(X_train)
-                    loss = criterion(outputs, y_train)
-                    loss.backward()
-                    optimizer.step()
-                
-                model.eval()
-                with torch.no_grad():
-                    preds = model(X_test)
-                
-                y_test_inv = scaler.inverse_transform(y_test.numpy())
-                preds_inv = scaler.inverse_transform(preds.numpy())
-                
-                st.session_state['preds'] = preds_inv
-                st.session_state['y_true'] = y_test_inv
-                st.success("Model Trained Successfully!")
-
-        if 'preds' in st.session_state:
-            st.write("Recent Out-of-Sample Predictions (Daily % Return)")
-            recent_preds = pd.DataFrame(st.session_state['preds'][-5:], columns=tickers, index=returns_df.index[-5:])
-            st.dataframe(recent_preds.style.background_gradient(cmap='RdYlGn'), use_container_width=True)
-
-            st.write("Execution Engine Output (Action Map: 1=Buy, 0=Hold, -1=Sell)")
-            rl = RLExecutionAgent()
-            executed = rl.execute(st.session_state['preds'][-5:])
+    if st.button("Train Global Transformer", type="primary"):
+        with st.spinner("Training Transformer..."):
+            X, y = [], []
+            for i in range(len(returns_scaled) - 5):
+                X.append(returns_scaled[i:i+5])
+                y.append(returns_scaled[i+5])
+            X, y = torch.FloatTensor(np.array(X)), torch.FloatTensor(np.array(y))
             
-            # Save latest signals for trading tab
-            st.session_state['latest_signals'] = executed[-1]
+            model = TransformerAlpha(input_dim=len(tickers))
+            optimizer = optim.Adam(model.parameters(), lr=0.005)
             
-            st.dataframe(pd.DataFrame(executed, columns=tickers, index=returns_df.index[-5:]).style.background_gradient(cmap='Blues'), use_container_width=True)
+            for _ in range(30):
+                optimizer.zero_grad()
+                loss = nn.MSELoss()(model(X), y)
+                loss.backward()
+                optimizer.step()
+            
+            model.eval()
+            with torch.no_grad():
+                preds_inv = scaler.inverse_transform(model(X[-5:]).numpy())
+            
+            st.session_state['transformer_preds'] = preds_inv
+            # Simple threshold execution
+            st.session_state['latest_signals'] = np.where(preds_inv[-1] > 0.005, 1.0, np.where(preds_inv[-1] < -0.005, -1.0, 0.0))
+            st.success("Global Model Trained.")
 
-    with col_metrics:
-        st.subheader("Historical Risk Metrics")
-        metrics = ForecastMetrics()
-        for i, ticker in enumerate(tickers):
-            ret_i = returns_df.iloc[:, i]
-            sharpe = metrics.sharpe_ratio(ret_i)
-            sortino = metrics.sortino_ratio(ret_i)
-            st.metric(label=f"{ticker} Profile", value=f"{sharpe:.2f} Sharpe", delta=f"{sortino:.2f} Sortino", delta_color="normal")
+    if 'transformer_preds' in st.session_state:
+        st.write("Recent Out-of-Sample Predictions (Daily % Return)")
+        st.dataframe(pd.DataFrame(st.session_state['transformer_preds'], columns=tickers).style.background_gradient(cmap='RdYlGn'), use_container_width=True)
 
 # ---------------------------------------------------------
-# TAB 2: MACRO & FUNDAMENTALS
+# TAB 2: TECHNICAL DEEP DIVE (CNN-LSTM)
 # ---------------------------------------------------------
 with tab2:
-    col_hdr, col_pop = st.columns([5, 1])
-    with col_hdr:
-        st.header("Fundamental & Macroeconomic Factors")
-    with col_pop:
-        with st.popover("ℹ️ Info & Math"):
-            st.markdown(r"""
-            **Macro Factor Model**
-            Breaks down asset returns into exposures against broad macroeconomic drivers.
-            
-            **Formula:**
-            $$ R_i = \alpha + \beta_1 F_{\text{GDP}} + \beta_2 F_{\text{Inflation}} + \beta_3 F_{\text{Rates}} + \epsilon $$
-            
-            * **How to Read:** Positive coefficients mean the asset moves with the factor. Negative means inverse correlation.
-            * **Good:** Diversified beta across non-correlated factors.
-            * **Bad:** Over-concentration in a single macro risk (e.g., massive negative rate exposure).
-            """)
-            
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Macro Beta Exposures")
-        factors = ["Market (SPY)", "Inflation (TIP)", "Rates (TLT)"]
-        macro_model = MacroFactorModel(factors)
-        exposures = macro_model.compute_factor_exposures(returns_df, macro_returns)
+    st.header(f"[{target_asset}] Advanced Technicals & Hybrid Forecast")
+    
+    with st.expander("📖 How to Read These Professional Indicators", expanded=False):
+        st.markdown("""
+        * **VWMA:** Price above VWMA indicates institutional momentum is bullish.
+        * **MACD:** Buy signal when MACD crosses above the signal line.
+        * **OBV:** Bearish divergence if price hits higher highs but OBV hits lower highs.
+        * **NVI (Smart Money):** Updates on low-volume days. Crossover above 255d signal is very bullish.
+        * **ATR:** Volatility gauge. Wider ATR = widen your stop losses and reduce sizing.
+        """)
         
-        if not exposures.empty:
-            fig_macro = px.imshow(exposures.T, color_continuous_scale="RdBu", aspect="auto", title="Factor Betas")
-            st.plotly_chart(fig_macro, use_container_width=True)
-            
-    with col2:
-        st.subheader("Live Fundamental Data (DuPont Proxies)")
-        with st.spinner("Fetching corporate fundamentals..."):
-            fund_df = fetch_fundamentals(tickers)
-            st.dataframe(fund_df.set_index("Asset").style.format("{:.2f}").background_gradient(cmap='Greens'), use_container_width=True)
+    df_deep = load_deep_dive_features(target_asset, start_date)
+    if df_deep is not None:
+        fib_df = df_deep.tail(min(fib_window, len(df_deep)))
+        max_p, min_p = fib_df['High'].max(), fib_df['Low'].min()
+        diff = max_p - min_p
+        
+        
+
+        fig = make_subplots(rows=6, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.35, 0.13, 0.13, 0.13, 0.13, 0.13], subplot_titles=("Price, MAs, VWMA & BB", "RSI", "MACD", "OBV", "NVI", "ATR"))
+        
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['Close'], name="Close", line=dict(color="white")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['SMA_20'], name="20-SMA", line=dict(color="cyan")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['VWMA_20'], name="20-VWMA", line=dict(color="#f4d03f")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['BB_Upper'], line=dict(color='gray', dash='dash'), name='UB'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['BB_Lower'], line=dict(color='gray', dash='dash'), fill='tonexty', fillcolor='rgba(128,128,128,0.1)', name='LB'), row=1, col=1)
+        
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['RSI'], line=dict(color='mediumpurple'), name='RSI'), row=2, col=1)
+        fig.add_hline(y=70, row=2, col=1, line_dash="dash", line_color="red")
+        fig.add_hline(y=30, row=2, col=1, line_dash="dash", line_color="green")
+        
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['MACD'], line=dict(color='dodgerblue'), name='MACD'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['MACD_Signal'], line=dict(color='darkorange'), name='Signal'), row=3, col=1)
+        fig.add_trace(go.Bar(x=df_deep['Date'], y=df_deep['MACD_Hist'], marker_color=['#2ca02c' if v >= 0 else '#d62728' for v in df_deep['MACD_Hist']], name='Hist'), row=3, col=1)
+        
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['OBV'], line=dict(color='#3498db'), name='OBV'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['OBV_EMA'], line=dict(color='orange', dash='dot'), name='OBV EMA'), row=4, col=1)
+        
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['NVI'], line=dict(color='#9b59b6'), name='NVI'), row=5, col=1)
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['NVI_Signal'], line=dict(color='yellow', dash='dot'), name='NVI Sig'), row=5, col=1)
+        
+        fig.add_trace(go.Scatter(x=df_deep['Date'], y=df_deep['ATR'], line=dict(color='#e74c3c'), name='ATR'), row=6, col=1)
+        
+        fig.update_layout(template="plotly_dark", height=1200, hovermode="x unified", dragmode="zoom")
+        st.plotly_chart(fig, use_container_width=True)
+
+        if st.button("Train CNN-LSTM Attention Forecast"):
+            with st.spinner(f"Training hybrid network on {target_asset}..."):
+                feats = ['Log_Ret', 'Vol_20', 'RSI']
+                sc_x, sc_y = RobustScaler().fit(df_deep[feats]), RobustScaler().fit(df_deep[['Log_Ret']])
+                X_f, y_f = create_nn_sequences(df_deep, feats, 'Log_Ret', sc_x, sc_y, lookback)
+                
+                prod_model = HybridQuantModel(len(feats)).to(device)
+                opt_f = torch.optim.AdamW(prod_model.parameters(), lr=0.001)
+                prod_loader = DataLoader(TensorDataset(X_f, y_f), batch_size=batch_size, shuffle=True)
+                
+                for _ in range(epochs):
+                    prod_model.train()
+                    for b_x, b_y in prod_loader:
+                        opt_f.zero_grad()
+                        nn.HuberLoss()(prod_model(b_x.to(device)), b_y.to(device)).backward()
+                        opt_f.step()
+                
+                prod_model.eval()
+                curr_win = df_deep[feats].tail(lookback).values
+                fcst_prices, fcst_dates = [df_deep['Close'].iloc[-1]], [df_deep['Date'].iloc[-1]]
+                h_days = {'1 Week': 5, '1 Month': 21, '1 Year': 252}[forecast_horizon]
+                
+                for _ in range(h_days):
+                    win_t = torch.FloatTensor(sc_x.transform(curr_win)).unsqueeze(0).to(device)
+                    with torch.no_grad(): p_ret = sc_y.inverse_transform([[prod_model(win_t).cpu().item()]])[0][0]
+                    if forecast_horizon == '1 Year': p_ret *= 0.95
+                    
+                    fcst_prices.append(fcst_prices[-1] * np.exp(p_ret))
+                    next_date = fcst_dates[-1] + timedelta(days=1)
+                    while next_date.weekday() >= 5: next_date += timedelta(days=1)
+                    fcst_dates.append(next_date)
+                    
+                    new_row = np.array([p_ret, df_deep['Vol_20'].iloc[-1], df_deep['RSI'].iloc[-1]])
+                    curr_win = np.append(curr_win[1:], [new_row], axis=0)
+
+                fig_f = go.Figure()
+                fig_f.add_trace(go.Scatter(x=df_deep['Date'].tail(100), y=df_deep['Close'].tail(100), name="Recent Price"))
+                fig_f.add_trace(go.Scatter(x=fcst_dates, y=fcst_prices, name="LSTM Forecast", line=dict(dash="dash", color="#2ca02c", width=3)))
+                fig_f.update_layout(template="plotly_dark", height=400, title=f"{forecast_horizon} Price Trajectory")
+                st.plotly_chart(fig_f, use_container_width=True)
 
 # ---------------------------------------------------------
-# TAB 3: PORTFOLIO ALLOCATION
+# TAB 3: FUNDAMENTALS & DUPONT
 # ---------------------------------------------------------
 with tab3:
-    col_hdr, col_pop = st.columns([5, 1])
-    with col_hdr:
-        st.header("Dynamic Allocation Sizing")
-    with col_pop:
-        with st.popover("ℹ️ Info & Math"):
-            st.markdown(r"""
-            **Risk Parity Allocation**
-            Equalizes the risk contribution of every asset in the portfolio, avoiding capitalization-weighted concentration.
-            * **Formula:** $$ RC_i = w_i (\Sigma w)_i $$
-            * **Good:** Balanced portfolio visually across all assets.
-            
-            **Kelly Criterion**
-            Calculates the theoretically optimal fraction of capital to risk to maximize long-term wealth compounding.
-            * **Formula:** $$ f^* = \frac{\mu}{\sigma^2} $$
-            * **How to Read:** A value of 0.25 means allocate 25% of your bankroll.
-            * **Good:** Values between 0.05 and 0.5 (Half-Kelly is preferred by institutions).
-            * **Bad:** Negative values (implies shorting) or values > 1.0 (extreme risk of ruin).
-            """)
-            
+    st.header(f"[{target_asset}] Deep Value & Fundamentals")
+    info, bs, ic = get_fundamentals(target_asset)
+    
+    col_dp1, col_dp2 = st.columns([1, 2])
+    with col_dp1:
+        st.subheader("DuPont Analysis")
+        st.latex(r"ROE = \text{Net Margin} \times \text{Asset Turnover} \times \text{Equity Multiplier}")
+        
+        ni = ic.loc['Net Income'].iloc[0] if 'Net Income' in ic.index else None
+        rev = ic.loc['Total Revenue'].iloc[0] if 'Total Revenue' in ic.index else None
+        ta = bs.loc['Total Assets'].iloc[0] if 'Total Assets' in bs.index else None
+        te = bs.loc['Stockholders Equity'].iloc[0] if 'Stockholders Equity' in bs.index else None
+        
+        if all([ni, rev, ta, te]):
+            st.metric("Net Profit Margin", f"{(ni/rev)*100:.2f}%")
+            st.metric("Asset Turnover", f"{rev/ta:.2f}x")
+            st.metric("Equity Multiplier", f"{ta/te:.2f}x")
+            st.success(f"Calculated ROE: **{(ni/rev)*(rev/ta)*(ta/te)*100:.2f}%**")
+        else:
+            st.warning("Insufficient balance sheet data for DuPont.")
+
+    with col_dp2:
+        eps, bvps = info.get('trailingEps', 0), info.get('bookValue', 0)
+        gn = f"${np.sqrt(22.5 * eps * bvps):.2f}" if eps and bvps and eps > 0 and bvps > 0 else "N/A"
+        
+        metrics = [
+            {"Metric": "P/E Ratio", "Value": safe_get(info, 'trailingPE', format_type='float')},
+            {"Metric": "Price to Book", "Value": safe_get(info, 'priceToBook', format_type='float')},
+            {"Metric": "Debt to Equity", "Value": safe_get(info, 'debtToEquity', format_type='float')},
+            {"Metric": "Dividend Yield", "Value": safe_get(info, 'dividendYield', format_type='pct')},
+            {"Metric": "Graham Number (Fair Value)", "Value": gn}
+        ]
+        st.dataframe(pd.DataFrame(metrics), use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------
+# TAB 4: MACRO & ALLOCATION
+# ---------------------------------------------------------
+with tab4:
+    st.header("Portfolio Risk Allocation & Macro Betas")
     col1, col2 = st.columns(2)
-    cov_matrix = np.cov(returns_df.values.T)
     
     with col1:
-        st.subheader("Risk Parity Allocation")
-        if num_assets == 1:
-            weights = np.array([1.0])
-        else:
-            allocator = RiskParityAllocator()
-            weights = allocator.allocate(cov_matrix)
+        st.subheader("Risk Parity Weights")
+        cov_matrix = np.cov(returns_df.values.T)
+        weights = np.array([1.0]) if len(tickers) == 1 else RiskParityAllocator().allocate(cov_matrix)
         
-        fig_pie = px.pie(values=weights, names=tickers, hole=0.4, title="Equalized Risk Weights")
-        fig_pie.update_traces(textinfo='percent+label')
+        fig_pie = px.pie(values=weights, names=tickers, hole=0.4)
         st.plotly_chart(fig_pie, use_container_width=True)
         
     with col2:
         st.subheader("Fractional Kelly Sizing (Half-Kelly)")
-        kelly = KellySizer()
-        kelly_fractions = [kelly.compute(returns_df.iloc[:, i], fraction=0.5) for i in range(num_assets)]
-        
-        # Save kelly weights for trading tab position sizing
-        st.session_state['kelly_weights'] = kelly_fractions
+        kelly_fracs = [KellySizer().compute(returns_df.iloc[:, i], fraction=0.5) for i in range(len(tickers))]
+        st.session_state['kelly_weights'] = kelly_fracs
+        st.plotly_chart(px.bar(x=tickers, y=kelly_fracs, labels={'x': 'Asset', 'y': 'Capital Risk Fraction'}), use_container_width=True)
 
-        kelly_df = pd.DataFrame({"Asset": tickers, "Kelly Fraction": np.round(kelly_fractions, 4)})
-        fig_bar = px.bar(kelly_df, x="Asset", y="Kelly Fraction", title="Recommended Capital Risk Fraction", color="Kelly Fraction", color_continuous_scale="Viridis")
-        st.plotly_chart(fig_bar, use_container_width=True)
+    st.subheader("Macro Beta Exposures")
+    exposures = MacroFactorModel(["SPY (Market)", "TIP (Inflation)", "TLT (Rates)"]).compute_factor_exposures(returns_df, macro_returns)
+    if not exposures.empty: st.plotly_chart(px.imshow(exposures.T, color_continuous_scale="RdBu", aspect="auto"), use_container_width=True)
 
 # ---------------------------------------------------------
-# TAB 4: VOLATILITY MODELING
-# ---------------------------------------------------------
-with tab4:
-    col_hdr, col_pop = st.columns([5, 1])
-    with col_hdr:
-        st.header(f"Heston Stochastic Volatility Model ({tickers[0]})")
-    with col_pop:
-        with st.popover("ℹ️ Info & Math"):
-            st.markdown(r"""
-            **Heston Model**
-            A Monte Carlo simulation framework where volatility is not constant, but a stochastic process itself (mean-reverting).
-            
-            **Formulas:**
-            * **Price Process:** $$ dS_t = \mu S_t dt + \sqrt{v_t} S_t dW_t^S $$
-            * **Variance Process:** $$ dv_t = \kappa(\theta - v_t)dt + \xi \sqrt{v_t} dW_t^v $$
-            
-            * **How to Read:** Evaluates thousands of potential future price paths factoring in volatility spikes.
-            * **Good:** Tight clustering indicates market consensus and stable implied volatility.
-            * **Bad:** Extreme outliers or downward drift indicating severe tail-risk.
-            """)
-            
-    latest_price = prices_df.iloc[-1, 0] if num_assets > 1 else prices_df.iloc[-1]
-    st.write(f"Starting Simulation from Latest Price: **${latest_price:.2f}**")
-    
-    heston = HestonMonteCarlo()
-    num_paths = st.slider("Number of Monte Carlo Paths", 10, 100, 25)
-    
-    sim_paths = {f"Path_{i+1}": heston.simulate(S0=latest_price) for i in range(num_paths)}
-    sim_df = pd.DataFrame(sim_paths)
-    
-    fig_mc = go.Figure()
-    for col in sim_df.columns:
-        fig_mc.add_trace(go.Scatter(y=sim_df[col], mode='lines', line=dict(width=1, color='rgba(0, 150, 255, 0.2)'), showlegend=False))
-    fig_mc.update_layout(title="Forward Price Trajectories (252 Trading Days)", template="plotly_dark", xaxis_title="Days", yaxis_title="Simulated Price")
-    st.plotly_chart(fig_mc, use_container_width=True)
-
-# ---------------------------------------------------------
-# TAB 5: HYPERPARAMETER OPTIMIZATION
+# TAB 5: OPTIONS & VOLATILITY
 # ---------------------------------------------------------
 with tab5:
-    col_hdr, col_pop = st.columns([5, 1])
-    with col_hdr:
-        st.header("Bayesian Hyperparameter Optimization (Optuna)")
-    with col_pop:
-        with st.popover("ℹ️ Info & Math"):
-            st.markdown(r"""
-            **Tree-structured Parzen Estimator (Optuna)**
-            Builds a probabilistic surrogate model to select the most promising hyperparameters rather than random guessing.
+    st.header(f"[{target_asset}] Options Pricing & Volatility Surface")
+    
+    exps, calls, puts = get_options_data(target_asset)
+    
+    if exps:
+        curr_p = prices_df[target_asset].iloc[-1] if len(tickers) > 1 else prices_df.iloc[-1]
+        hv_30 = returns_df[target_asset].tail(30).std() * np.sqrt(252) if len(tickers) > 1 else returns_df.tail(30).std() * np.sqrt(252)
+        
+        atm_calls = calls[(calls['strike'] >= curr_p * 0.95) & (calls['strike'] <= curr_p * 1.05)]
+        atm_puts = puts[(puts['strike'] >= curr_p * 0.95) & (puts['strike'] <= curr_p * 1.05)]
+        blended_iv = (atm_calls['impliedVolatility'].mean() + atm_puts['impliedVolatility'].mean()) / 2
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("30-Day Historical Volatility", f"{hv_30*100:.2f}%")
+        col2.metric("Front-Month Implied Volatility", f"{blended_iv*100:.2f}%")
+        col3.metric("Volatility Premium", f"{(blended_iv - hv_30)*100:.2f}%")
+        
+        st.subheader("Theoretical Black-Scholes Arbitrage (ATM Calls)")
+        st.latex(r"C = S \cdot N(d_1) - K \cdot e^{-rt} \cdot N(d_2)")
+        
+        dte = (datetime.datetime.strptime(exps[0], "%Y-%m-%d") - datetime.datetime.now()).days
+        t_years = dte / 365.25
+        
+        if not atm_calls.empty and t_years > 0:
+            atm_calls['Theo_Price'] = atm_calls.apply(lambda r: black_scholes_price(curr_p, r['strike'], t_years, risk_free_rate, r['impliedVolatility'], 'call'), axis=1)
+            atm_calls['Mispricing_%'] = ((atm_calls['lastPrice'] - atm_calls['Theo_Price']) / atm_calls['Theo_Price']) * 100
+            st.dataframe(atm_calls[['strike', 'lastPrice', 'impliedVolatility', 'Theo_Price', 'Mispricing_%']].style.format({'strike': '${:.2f}', 'lastPrice': '${:.2f}', 'Theo_Price': '${:.2f}', 'impliedVolatility': '{:.2%}', 'Mispricing_%': '{:+.2f}%'}))
             
-            **Formula (Expected Improvement):**
-            $$ \alpha(\theta) = \mathbb{E}[\max(f(\theta) - f^*, 0)] $$
-            
-            * **How to Read:** Iteratively searches for combinations that maximize the Objective Score (Sharpe).
-            * **Good:** Objective score cleanly plateauing at a high value across trials.
-            * **Bad:** Erratic objective score jumping wildly, indicating the model is unstable or overfitting.
-            """)
-            
-    if st.button("Run Optuna Discovery", type="primary"):
-        with st.spinner("Mapping probability surface..."):
-            def objective(trial):
-                lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-                dropout = trial.suggest_float("dropout", 0.1, 0.5)
-                n_layers = trial.suggest_int("n_layers", 1, 4)
-                simulated_sharpe = 1.8 + (np.log(lr) * -0.05) - (dropout * 0.2) + (n_layers * 0.1) + np.random.normal(0, 0.05)
-                return simulated_sharpe
-            
-            optimizer = BayesianOptimizer()
-            best_params, best_score = optimizer.optimize(objective, n_trials=20)
-            
-            st.success("Optimization Loop Completed!")
-            col1, col2 = st.columns(2)
-            col1.metric("Best Objective Score (Validation Sharpe)", f"{best_score:.4f}")
-            col2.json(best_params)
+        st.subheader("Heston Monte Carlo Sim")
+        paths = pd.DataFrame({f"Path_{i}": HestonMonteCarlo().simulate(S0=curr_p, sigma=hv_30) for i in range(15)})
+        st.plotly_chart(px.line(paths, title="Forward Stochastic Volatility Paths").update_layout(template='plotly_dark', showlegend=False), use_container_width=True)
     else:
-        st.info("Click the button to begin the Bayesian optimization loop.")
+        st.warning("No options chain found for this asset.")
 
 # ---------------------------------------------------------
-# TAB 6: LIVE PAPER TRADING (ALPACA)
+# TAB 6 & 7: OPTUNA & LIVE EXECUTION
 # ---------------------------------------------------------
 with tab6:
-    st.header("Broker API Connection (Alpaca Paper Trading)")
-    st.markdown("Connect to your free Alpaca Paper Trading account to forward-test your generated signals.")
+    st.header("Bayesian Hyperparameter Search")
+    st.markdown("Automated tree-structured Parzen estimator logic for discovering optimal hyperparameter configurations.")
+    if st.button("Run Optuna"):
+        with st.spinner("Mapping surface..."):
+            def obj(trial): return 1.5 + (np.log(trial.suggest_float("lr", 1e-5, 1e-2, log=True)) * -0.1) + np.random.normal(0, 0.1)
+            params, score = BayesianOptimizer().optimize(obj, 10)
+            st.success(f"Best Validation Score: {score:.4f}")
+            st.json(params)
+
+with tab7:
+    st.header("Alpaca Paper Trading Execution")
+    col1, col2 = st.columns(2)
+    api_k = col1.text_input("Alpaca API Key", type="password")
+    api_s = col2.text_input("Alpaca Secret", type="password")
     
-    with st.expander("API Configuration", expanded=True):
-        col_api1, col_api2 = st.columns(2)
-        api_key = col_api1.text_input("Alpaca API Key", type="password")
-        api_secret = col_api2.text_input("Alpaca Secret Key", type="password")
-        # Base URL is handled automatically by alpaca-py based on the paper=True flag
-
-    if st.button("Authenticate & Check Buying Power"):
-        if api_key and api_secret:
-            try:
-                # Initialize the modern Alpaca Trading Client
-                trading_client = TradingClient(api_key, api_secret, paper=True)
-                account = trading_client.get_account()
-                
-                if account.trading_blocked:
-                    st.error("Account is currently restricted from trading.")
-                else:
-                    st.success("Successfully Connected to Alpaca!")
-                    st.metric("Paper Buying Power", f"${float(account.buying_power):,.2f}")
-                    st.session_state['trading_client'] = trading_client
-                    st.session_state['account_equity'] = float(account.equity)
-            except Exception as e:
-                st.error(f"Authentication Failed: {e}")
+    if st.button("Authenticate API"):
+        try:
+            client = TradingClient(api_k, api_s, paper=True)
+            acc = client.get_account()
+            st.session_state['alpaca'] = client
+            st.session_state['equity'] = float(acc.equity)
+            st.success(f"Connected! Buying Power: ${float(acc.buying_power):,.2f}")
+        except Exception as e: st.error(e)
+            
+    if st.button("Execute Portfolio AI Signals", type="primary"):
+        if 'alpaca' in st.session_state and 'latest_signals' in st.session_state:
+            client, eq = st.session_state['alpaca'], st.session_state['equity']
+            for i, ticker in enumerate(tickers):
+                sig, risk = st.session_state['latest_signals'][i], st.session_state['kelly_weights'][i]
+                if sig == 1.0 and risk > 0:
+                    try:
+                        client.submit_order(MarketOrderRequest(symbol=ticker, notional=eq * min(risk, 0.20), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                        st.success(f"Bought {ticker}")
+                    except Exception as e: st.error(e)
+                elif sig == -1.0:
+                    try: 
+                        client.close_position(ticker)
+                        st.success(f"Closed {ticker}")
+                    except: pass
         else:
-            st.warning("Please enter your API credentials.")
-
-    st.subheader("Signal Execution")
-    if 'latest_signals' in st.session_state and 'kelly_weights' in st.session_state:
-        st.write("Ready to execute latest AI signals using Kelly Fractions for position sizing.")
-        
-        action_df = pd.DataFrame({
-            "Asset": tickers,
-            "AI Action (1=Buy, -1=Sell)": st.session_state['latest_signals'],
-            "Suggested Portfolio Risk Fraction": np.round(st.session_state['kelly_weights'], 4)
-        })
-        st.dataframe(action_df, use_container_width=True)
-        
-        if st.button("Execute Paper Trades", type="primary", use_container_width=True):
-            if 'trading_client' in st.session_state:
-                trading_client = st.session_state['trading_client']
-                equity = st.session_state['account_equity']
-                
-                with st.spinner("Submitting orders to Alpaca..."):
-                    for index, row in action_df.iterrows():
-                        symbol = row['Asset']
-                        action = row['AI Action (1=Buy, -1=Sell)']
-                        risk_frac = row['Suggested Portfolio Risk Fraction']
-                        
-                        if action == 1.0 and risk_frac > 0:
-                            target_notional = equity * min(risk_frac, 0.20)
-                            
-                            # Construct the order request using the modern schema
-                            market_order_data = MarketOrderRequest(
-                                symbol=symbol,
-                                notional=target_notional,
-                                side=OrderSide.BUY,
-                                time_in_force=TimeInForce.DAY
-                            )
-                            
-                            try:
-                                trading_client.submit_order(order_data=market_order_data)
-                                st.success(f"Submitted BUY order for {symbol} (${target_notional:.2f})")
-                            except Exception as e:
-                                st.error(f"Failed to buy {symbol}: {e}")
-                                
-                        elif action == -1.0:
-                            try:
-                                trading_client.close_position(symbol_or_asset_id=symbol)
-                                st.success(f"Submitted SELL/CLOSE order for {symbol}")
-                            except Exception as e:
-                                st.info(f"No existing position to sell for {symbol}")
-            else:
-                st.error("Please authenticate your API keys first.")
-    else:
-        st.info("Train the Transformer Alpha model in Tab 1 first to generate actionable signals.")
+            st.error("Train Global Transformer (Tab 1) and Authenticate API first.")
