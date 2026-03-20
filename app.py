@@ -19,7 +19,7 @@ from typing import Dict, Callable
 import datetime
 from datetime import timedelta
 
-# Alpaca Imports
+# Alpaca Imports#
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
